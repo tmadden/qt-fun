@@ -1,0 +1,6 @@
+[requires]
+Boost/1.62.0@lasote/testing
+catch/1.5.0@TyRoXx/stable
+
+[generators]
+cmake
