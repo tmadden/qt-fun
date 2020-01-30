@@ -1,6 +1,5 @@
 [requires]
-Boost/1.62.0@lasote/testing
-catch/1.5.0@TyRoXx/stable
+qt/5.14.1@bincrafters/stable
 
 [generators]
 cmake

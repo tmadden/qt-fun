@@ -1,16 +1,19 @@
 #include <QApplication>
-#include <QWidget>
 #include <QFrame>
 #include <QGridLayout>
 #include <QLabel>
-#include <QPushButton>
 #include <QLayout>
+#include <QPushButton>
 #include <QTextEdit>
+#include <QWidget>
 
-#include <alia/data_graph.hpp>
-#include <alia/actions.hpp>
+#define ALIA_LOWERCASE_MACROS
+#define ALIA_IMPLEMENTATION
+#include "alia.hpp"
 
 using namespace alia;
+
+using std::string;
 
 struct qt_layout_node;
 struct qt_layout_container;
@@ -23,15 +26,17 @@ struct qt_system
     // the root of the application's UI tree
     qt_layout_node* root;
 
-    // the top-level window and layout for the UI - The entire application's UI tree lives
-    // inside this.
+    // the top-level window and layout for the UI - The entire application's UI
+    // tree lives inside this.
     QWidget* window;
-    QVBoxLayout *layout;
+    QVBoxLayout* layout;
 };
 
 struct qt_layout_node
 {
-    virtual void update(qt_system* system, QWidget* parent, QLayout* layout) = 0;
+    virtual void
+    update(qt_system* system, QWidget* parent, QLayout* layout)
+        = 0;
 
     qt_layout_node* next;
     qt_layout_container* parent;
@@ -41,7 +46,8 @@ struct qt_layout_container : qt_layout_node
 {
     qt_layout_node* children;
 
-    virtual void record_change();
+    virtual void
+    record_change();
 
     qt_layout_container* parent;
 
@@ -50,9 +56,9 @@ struct qt_layout_container : qt_layout_node
 
 struct qt_event
 {
-    // This is just a hack for now. A null pointer here means that this is a refresh
-    // event. A non-null pointer means that some event happened for that widget (and it
-    // should be obvious what).
+    // This is just a hack for now. A null pointer here means that this is a
+    // refresh event. A non-null pointer means that some event happened for that
+    // widget (and it should be obvious what).
     QWidget* target;
 };
 
@@ -71,18 +77,20 @@ struct qt_context
     qt_event* event;
 };
 
+void
+issue_ui_event(qt_system& system, QWidget* target);
+void
+update_ui(qt_system& system);
 
-void issue_ui_event(qt_system& system, QWidget* target);
-void update_ui(qt_system& system);
-
-
-void record_layout_change(qt_context& traversal)
+void
+record_layout_change(qt_context& traversal)
 {
     if (traversal.active_container)
         traversal.active_container->record_change();
 }
 
-void set_next_node(qt_context& traversal, qt_layout_node* node)
+void
+set_next_node(qt_context& traversal, qt_layout_node* node)
 {
     if (*traversal.next_ptr != node)
     {
@@ -91,13 +99,15 @@ void set_next_node(qt_context& traversal, qt_layout_node* node)
     }
 }
 
-void add_layout_node(qt_context& traversal, qt_layout_node* node)
+void
+add_layout_node(qt_context& traversal, qt_layout_node* node)
 {
     set_next_node(traversal, node);
     traversal.next_ptr = &node->next;
 }
 
-void record_container_change(qt_layout_container* container)
+void
+record_container_change(qt_layout_container* container)
 {
     while (container && !container->dirty)
     {
@@ -106,24 +116,37 @@ void record_container_change(qt_layout_container* container)
     }
 }
 
-void qt_layout_container::record_change()
+void
+qt_layout_container::record_change()
 {
     record_container_change(this);
 }
 
 struct scoped_layout_container : noncopyable
 {
-    scoped_layout_container() : traversal_(0) {}
-    scoped_layout_container(qt_context& traversal, qt_layout_container* container)
-    { begin(traversal, container); }
-    ~scoped_layout_container() { end(); }
-    void begin(qt_context& traversal, qt_layout_container* container);
-    void end();
+    scoped_layout_container() : traversal_(0)
+    {
+    }
+    scoped_layout_container(
+        qt_context& traversal, qt_layout_container* container)
+    {
+        begin(traversal, container);
+    }
+    ~scoped_layout_container()
+    {
+        end();
+    }
+    void
+    begin(qt_context& traversal, qt_layout_container* container);
+    void
+    end();
+
  private:
     qt_context* traversal_;
 };
 
-void scoped_layout_container::begin(
+void
+scoped_layout_container::begin(
     qt_context& traversal, qt_layout_container* container)
 {
     if (traversal.is_refresh_pass)
@@ -137,7 +160,8 @@ void scoped_layout_container::begin(
         traversal.active_container = container;
     }
 }
-void scoped_layout_container::end()
+void
+scoped_layout_container::end()
 {
     if (traversal_)
     {
@@ -151,9 +175,11 @@ void scoped_layout_container::end()
     }
 }
 
-
-alia::data_traversal& get_data_traversal(qt_context& ctx)
-{ return *ctx.data; }
+alia::data_traversal&
+get_data_traversal(qt_context& ctx)
+{
+    return *ctx.data;
+}
 
 template<class T>
 struct cached_property
@@ -164,15 +190,16 @@ struct cached_property
     bool dirty;
 };
 
-template<class T>
-void refresh_property(cached_property<T>& cache, accessor<T> const& property)
+template<class T, class Signal>
+void
+refresh_property(cached_property<T>& cache, Signal property)
 {
-    refresh_keyed_data(cache.value, property.id());
+    refresh_keyed_data(cache.value, property.value_id());
     // TODO: Decide how to handle cases where the property has changed but isn't
     // immediately available (specifically w.r.t. the dirty flag).
-    if (!is_valid(cache.value) && property.is_gettable())
+    if (!is_valid(cache.value) && signal_is_readable(property))
     {
-        set(cache.value, get(property));
+        set(cache.value, read_signal(property));
         cache.dirty = true;
     }
 }
@@ -182,7 +209,8 @@ struct qt_label : qt_layout_node
     std::shared_ptr<QLabel> object;
     cached_property<string> text;
 
-    void update(qt_system* system, QWidget* parent, QLayout* layout)
+    void
+    update(qt_system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -201,7 +229,7 @@ struct qt_label : qt_layout_node
 };
 
 static void
-do_label(qt_context& ctx, accessor<string> const& text)
+do_label(qt_context& ctx, readable<string> text)
 {
     qt_label* label;
     get_cached_data(ctx, &label);
@@ -217,7 +245,8 @@ struct qt_button : qt_layout_node
     std::shared_ptr<QPushButton> object;
     cached_property<string> text;
 
-    void update(qt_system* system, QWidget* parent, QLayout* layout)
+    void
+    update(qt_system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -226,9 +255,8 @@ struct qt_button : qt_layout_node
             if (parent->isVisible())
                 object->show();
             auto target = object.get();
-            QObject::connect(object.get(), &QPushButton::clicked,
-                [system,target]()
-                {
+            QObject::connect(
+                object.get(), &QPushButton::clicked, [system, target]() {
                     issue_ui_event(*system, target);
                     update_ui(*system);
                 });
@@ -243,10 +271,7 @@ struct qt_button : qt_layout_node
 };
 
 static void
-do_button(
-    qt_context& ctx,
-    accessor<string> const& text,
-    action const& on_click)
+do_button(qt_context& ctx, readable<string> text, action<> on_click)
 {
     qt_button* button;
     get_cached_data(ctx, &button);
@@ -255,10 +280,11 @@ do_button(
         refresh_property(button->text, text);
         add_layout_node(ctx, button);
     }
-    if (button->object && ctx.event->target == button->object.get() && on_click.is_ready())
+    if (button->object && ctx.event->target == button->object.get()
+        && action_is_ready(on_click))
     {
-        on_click.perform();
-        //end_pass(ctx);
+        perform_action(on_click);
+        // end_pass(ctx);
     }
 }
 
@@ -267,7 +293,8 @@ struct qt_text_control : qt_layout_node
     std::shared_ptr<QTextEdit> object;
     cached_property<string> text;
 
-    void update(qt_system* system, QWidget* parent, QLayout* layout)
+    void
+    update(qt_system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -276,9 +303,8 @@ struct qt_text_control : qt_layout_node
             if (parent->isVisible())
                 object->show();
             auto target = object.get();
-            QObject::connect(object.get(), &QTextEdit::textChanged,
-                [system,target]()
-                {
+            QObject::connect(
+                object.get(), &QTextEdit::textChanged, [system, target]() {
                     issue_ui_event(*system, target);
                     update_ui(*system);
                 });
@@ -294,9 +320,7 @@ struct qt_text_control : qt_layout_node
 };
 
 static void
-do_text_control(
-    qt_context& ctx,
-    accessor<string> const& text)
+do_text_control(qt_context& ctx, bidirectional<string> text)
 {
     qt_text_control* widget;
     get_cached_data(ctx, &widget);
@@ -307,14 +331,15 @@ do_text_control(
     }
     if (widget->object && ctx.event->target == widget->object.get())
     {
-        set(text, widget->object->toPlainText().toUtf8().constData());
-        //end_pass(ctx);
+        write_signal(text, widget->object->toPlainText().toUtf8().constData());
+        // end_pass(ctx);
     }
 }
 
 qt_system the_system;
 
-void initialize_ui(qt_system& system)
+void
+initialize_ui(qt_system& system)
 {
     system.root = 0;
     system.window = new QWidget;
@@ -322,9 +347,11 @@ void initialize_ui(qt_system& system)
     system.window->setLayout(system.layout);
 }
 
-void do_app_ui(qt_context& ctx);
+void
+do_app_ui(qt_context& ctx);
 
-void issue_ui_event(qt_system& system, QWidget* target)
+void
+issue_ui_event(qt_system& system, QWidget* target)
 {
     qt_context ctx;
 
@@ -349,7 +376,8 @@ void issue_ui_event(qt_system& system, QWidget* target)
     do_app_ui(ctx);
 }
 
-void refresh_ui(qt_system& system)
+void
+refresh_ui(qt_system& system)
 {
     issue_ui_event(system, 0);
 }
@@ -358,7 +386,8 @@ struct qt_column : qt_layout_container
 {
     std::shared_ptr<QVBoxLayout> object;
 
-    void update(qt_system* system, QWidget* parent, QLayout* layout)
+    void
+    update(qt_system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -377,21 +406,36 @@ struct qt_column : qt_layout_container
 
 struct column_layout : noncopyable
 {
-    column_layout() {}
-    column_layout(qt_context& ctx){ begin(ctx); }
-    ~column_layout() { end(); }
-    void begin(qt_context& ctx)
+    column_layout()
+    {
+    }
+    column_layout(qt_context& ctx)
+    {
+        begin(ctx);
+    }
+    ~column_layout()
+    {
+        end();
+    }
+    void
+    begin(qt_context& ctx)
     {
         qt_column* column;
         get_cached_data(ctx, &column);
         slc_.begin(ctx, column);
     }
-    void end() { slc_.end(); }
+    void
+    end()
+    {
+        slc_.end();
+    }
+
  private:
     scoped_layout_container slc_;
 };
 
-void update_ui(qt_system& system)
+void
+update_ui(qt_system& system)
 {
     refresh_ui(system);
     while (system.layout->takeAt(0))
@@ -399,7 +443,8 @@ void update_ui(qt_system& system)
     system.root->update(&system, system.window, system.layout);
 }
 
-int main(int argc, char *argv[])
+int
+main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
 
@@ -413,24 +458,25 @@ int main(int argc, char *argv[])
     return app.exec();
 }
 
-void do_app_ui(qt_context& ctx)
+void
+do_app_ui(qt_context& ctx)
 {
     column_layout row(ctx);
 
-    do_label(ctx, text("Hello, world!"));
+    do_label(ctx, val("Hello, world!"));
 
-    auto x = get_state(ctx, string());
+    auto x = get_state(ctx, val(string()));
     do_text_control(ctx, x);
     do_text_control(ctx, x);
 
     do_label(ctx, x);
 
-    auto state = get_state(ctx, true);
-    alia_if (state)
+    auto state = get_state(ctx, val(true));
+    alia_if(state)
     {
-        do_label(ctx, text("Secret message!"));
+        do_label(ctx, val("Secret message!"));
     }
     alia_end
 
-    do_button(ctx, text("Toggle!"), make_toggle_action(state));
+        do_button(ctx, val("Toggle!"), make_toggle_action(state));
 }
