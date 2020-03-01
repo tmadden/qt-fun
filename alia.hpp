@@ -66,12 +66,12 @@ struct exception : std::exception
     {
     }
 
-    ~exception() throw()
+    ~exception() noexcept(true)
     {
     }
 
     virtual char const*
-    what() const throw()
+    what() const noexcept(true)
     {
         return msg_->c_str();
     }
@@ -107,7 +107,7 @@ using void_t = typename make_void<Ts...>::type;
 // version of f that can be passed as an argument and still allows normal
 // overload resolution.
 #define ALIA_LAMBDIFY(f) [](auto&&... args) { return f(args...); }
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 #define alia_lambdify(f) ALIA_LAMBDIFY(f)
 #endif
 
@@ -125,7 +125,6 @@ namespace alia {
 // id_interface defines the interface required of all ID types.
 struct id_interface
 {
- public:
     virtual ~id_interface()
     {
     }
@@ -331,8 +330,8 @@ ref(id_interface const& id)
 }
 
 // simple_id<Value> takes a regular type (Value) and implements id_interface for
-// it. The type Value must be copyable, comparable for equality and ordering
-// (i.e., supply == and < operators), and convertible to a string.
+// it. The type Value must be copyable and comparable for equality and ordering
+// (i.e., supply == and < operators).
 template<class Value>
 struct simple_id : id_interface
 {
@@ -527,11 +526,11 @@ combine_ids(Id0 const& id0)
     return id0;
 }
 
-// no_id can be used when you have nothing to identify.
-struct no_id_type
+// null_id can be used when you have nothing to identify.
+struct null_id_type
 {
 };
-static simple_id<no_id_type*> const no_id(nullptr);
+static simple_id<null_id_type*> const null_id(nullptr);
 
 // unit_id can be used when there is only possible identify.
 struct unit_id_type
@@ -851,6 +850,29 @@ struct add_component_type<
 template<class Collection, class Tag>
 using add_component_type_t = typename add_component_type<Collection, Tag>::type;
 
+// add_component_types<Collection,Tag...>::type gives the type that results
+// from extending :Collection with the components defined by the given list of
+// tags.
+template<class Collection, class... Tag>
+struct add_component_types
+{
+};
+template<class Collection>
+struct add_component_types<Collection>
+{
+    typedef Collection type;
+};
+template<class Collection, class Tag, class... Rest>
+struct add_component_types<Collection, Tag, Rest...>
+    : add_component_types<
+          typename add_component_type<Collection, Tag>::type,
+          Rest...>
+{
+};
+template<class Collection, class... Tag>
+using add_component_types_t =
+    typename add_component_types<Collection, Tag...>::type;
+
 // remove_component_type<Collection,Tag>::type yields the type that results
 // from removing the component associated with :Tag from :Collection.
 template<class Collection, class Tag>
@@ -922,6 +944,18 @@ struct add_component_type
 template<class Collection, class Tag>
 using add_component_type_t = typename add_component_type<Collection, Tag>::type;
 
+// add_component_types<Collection,Tag...>::type gives the type that results
+// from extending :Collection with the components defined by the given list of
+// tags.
+template<class Collection, class... Tag>
+struct add_component_types
+{
+    typedef Collection type;
+};
+template<class Collection, class... Tag>
+using add_component_types_t =
+    typename add_component_types<Collection, Tag...>::type;
+
 // remove_component_type<Collection,Tag>::type yields the type that results from
 // removing the component associated with :Tag from :Collection.
 template<class Collection, class Tag>
@@ -962,13 +996,13 @@ make_empty_component_collection(Storage* storage)
 // new collection shares the storage of the original, so this should be used
 // with caution.
 //
-template<class Tag, class Collection>
+template<class Tag, class Collection, class Data>
 add_component_type_t<Collection, Tag>
-add_component(Collection collection, typename Tag::data_type data)
+add_component(Collection collection, Data&& data)
 {
     auto* storage = collection.storage;
     // Add the new data to the storage object.
-    storage->template add<Tag>(data);
+    storage->template add<Tag>(std::forward<Data&&>(data));
     // Create a collection with the proper type to reference the storage.
     return add_component_type_t<Collection, Tag>(storage);
 }
@@ -1001,31 +1035,40 @@ remove_component(Collection collection)
 // With this version, you supply a new storage object, and the function uses it
 // if needed to ensure that the original collection's storage is left untouched.
 //
+#ifdef ALIA_STATIC_COMPONENT_CHECKING
+template<class Tag, class Collection, class Storage>
+remove_component_type_t<Collection, Tag>
+remove_component(Collection collection, Storage*)
+{
+    return remove_component_type_t<Collection, Tag>(collection.storage);
+}
+#else
 template<class Tag, class Collection, class Storage>
 remove_component_type_t<Collection, Tag>
 remove_component(Collection collection, Storage* new_storage)
 {
-#ifdef ALIA_STATIC_COMPONENT_CHECKING
-    return remove_component_type_t<Collection, Tag>(collection.storage);
-#else
     *new_storage = *collection.storage;
     new_storage->template remove<Tag>();
     return remove_component_type_t<Collection, Tag>(new_storage);
-#endif
 }
+#endif
 
 // Determine if a component is in a collection.
 // :Tag identifies the component.
+#ifdef ALIA_STATIC_COMPONENT_CHECKING
+template<class Tag, class Collection>
+bool has_component(Collection)
+{
+    return detail::component_collection_contains_tag<Collection, Tag>::value;
+}
+#else
 template<class Tag, class Collection>
 bool
 has_component(Collection collection)
 {
-#ifdef ALIA_STATIC_COMPONENT_CHECKING
-    return detail::component_collection_contains_tag<Collection, Tag>::value;
-#else
     return collection.storage->template has<Tag>();
-#endif
 }
+#endif
 
 #ifdef ALIA_DYNAMIC_COMPONENT_CHECKING
 
@@ -1077,7 +1120,7 @@ struct component_caster<T&, T>
 // enabled, this generates a compile-time error if :Tag isn't contained
 // in :collection.
 template<class Tag, class Collection>
-auto
+decltype(auto)
 get_component(Collection collection)
 {
 #ifdef ALIA_STATIC_COMPONENT_CHECKING
@@ -1138,38 +1181,38 @@ struct generic_component_storage
     }
 };
 
-// any_pointer is a simple way to store pointers to any type in a
+// any_ref is a simple way to store references to any type in a
 // generic_component_storage object.
-struct any_pointer
+struct any_ref
 {
-    any_pointer()
+    any_ref()
     {
     }
 
     template<class T>
-    any_pointer(T* ptr) : ptr(ptr)
+    any_ref(std::reference_wrapper<T> ref) : ptr(&ref.get())
     {
     }
 
     void* ptr;
 };
 
-template<class Pointer>
-struct component_caster<any_pointer&, Pointer*>
+template<class T>
+struct component_caster<any_ref&, T&>
 {
-    static Pointer*
-    apply(any_pointer stored)
+    static T&
+    apply(any_ref stored)
     {
-        return reinterpret_cast<Pointer*>(stored.ptr);
+        return *reinterpret_cast<T*>(stored.ptr);
     }
 };
-template<class Pointer>
-struct component_caster<any_pointer, Pointer*>
+template<class T>
+struct component_caster<any_ref, T&>
 {
-    static Pointer*
-    apply(any_pointer stored)
+    static T&
+    apply(any_ref stored)
     {
-        return reinterpret_cast<Pointer*>(stored.ptr);
+        return *reinterpret_cast<T*>(stored.ptr);
     }
 };
 
@@ -1186,7 +1229,7 @@ struct component_accessor
         return storage.generic.template has<Tag>();
     }
     static void
-    add(Storage& storage, any_pointer data)
+    add(Storage& storage, any_ref data)
     {
         storage.generic.template add<Tag>(data);
     }
@@ -1195,7 +1238,7 @@ struct component_accessor
     {
         storage.generic.template remove<Tag>();
     }
-    static any_pointer
+    static any_ref
     get(Storage& storage)
     {
         return storage.generic.template get<Tag>();
@@ -1240,7 +1283,7 @@ struct component_accessor
         static void                                                            \
         add(Storage& storage, Tag::data_type data)                             \
         {                                                                      \
-            storage.name = data;                                               \
+            storage.name = &data;                                              \
         }                                                                      \
         static void                                                            \
         remove(Storage& storage)                                               \
@@ -1250,85 +1293,11 @@ struct component_accessor
         static Tag::data_type                                                  \
         get(Storage& storage)                                                  \
         {                                                                      \
-            return storage.name;                                               \
+            return *storage.name;                                              \
         }                                                                      \
     };
 
 } // namespace alia
-
-
-namespace alia {
-
-struct data_traversal;
-ALIA_DEFINE_COMPONENT_TYPE(data_traversal_tag, data_traversal*)
-
-struct event_traversal;
-ALIA_DEFINE_COMPONENT_TYPE(event_traversal_tag, event_traversal*)
-
-struct system;
-ALIA_DEFINE_COMPONENT_TYPE(system_tag, system*)
-
-// the structure we use to store components - It provides direct storage of the
-// commonly-used components in the core of alia.
-
-struct context_component_storage
-{
-    // directly-stored components
-    system* sys = nullptr;
-    event_traversal* event = nullptr;
-    data_traversal* data = nullptr;
-
-    // generic storage for other components
-    generic_component_storage<any_pointer> generic;
-
-    ALIA_IMPLEMENT_STORAGE_COMPONENT_ACCESSORS(context_component_storage)
-};
-
-ALIA_ADD_DIRECT_COMPONENT_ACCESS(context_component_storage, system_tag, sys)
-ALIA_ADD_DIRECT_COMPONENT_ACCESS(
-    context_component_storage, event_traversal_tag, event)
-ALIA_ADD_DIRECT_COMPONENT_ACCESS(
-    context_component_storage, data_traversal_tag, data)
-
-// the typedefs for the context - There are two because we want to be able to
-// represent the context with and without data capabilities.
-
-typedef add_component_type_t<
-    add_component_type_t<
-        empty_component_collection<context_component_storage>,
-        system_tag>,
-    event_traversal_tag>
-    dataless_context;
-
-typedef add_component_type_t<dataless_context, data_traversal_tag> context;
-
-// And some convenience functions...
-
-context
-make_context(
-    context_component_storage* storage,
-    system* sys,
-    event_traversal* event,
-    data_traversal* data);
-
-template<class Context>
-event_traversal&
-get_event_traversal(Context ctx)
-{
-    return *get_component<event_traversal_tag>(ctx);
-}
-
-template<class Context>
-data_traversal&
-get_data_traversal(Context ctx)
-{
-    return *get_component<data_traversal_tag>(ctx);
-}
-
-} // namespace alia
-
-
-#include <functional>
 
 
 
@@ -1436,11 +1405,11 @@ struct untyped_signal_base
 {
     // Can the signal currently be read from?
     virtual bool
-    is_readable() const = 0;
+    has_value() const = 0;
 
     // A signal must supply an ID that uniquely identifies its value.
-    // The ID is required to be valid if is_readable() returns true.
-    // (It may be valid even if is_readable() returns false, which would mean
+    // The ID is required to be valid if has_value() returns true.
+    // (It may be valid even if has_value() returns false, which would mean
     // that the signal can identify its value but doesn't know it yet.)
     // The returned ID reference is only valid as long as the signal itself is
     // valid.
@@ -1449,7 +1418,7 @@ struct untyped_signal_base
 
     // Can the signal currently be written to?
     virtual bool
-    is_writable() const = 0;
+    ready_to_write() const = 0;
 };
 
 template<class Value>
@@ -1473,7 +1442,7 @@ struct signal_base : signal_interface<Value>
     typedef Direction direction_tag;
 
     template<class Index>
-    auto operator[](Index const& index) const;
+    auto operator[](Index index) const;
 };
 
 template<class Derived, class Value, class Direction>
@@ -1489,12 +1458,12 @@ struct signal<Derived, Value, read_only_signal>
     // obviously won't be used on a read-only signal.
     // LCOV_EXCL_START
     bool
-    is_writable() const
+    ready_to_write() const
     {
         return false;
     }
     void
-    write(Value const& value) const
+    write(Value const&) const
     {
     }
     // LCOV_EXCL_STOP
@@ -1510,10 +1479,10 @@ struct signal<Derived, Value, write_only_signal>
     id_interface const&
     value_id() const
     {
-        return no_id;
+        return null_id;
     }
     bool
-    is_readable() const
+    has_value() const
     {
         return false;
     }
@@ -1555,9 +1524,9 @@ struct signal_ref : signal<signal_ref<Value, Direction>, Value, Direction>
     // implementation of signal_interface...
 
     bool
-    is_readable() const
+    has_value() const
     {
-        return ref_->is_readable();
+        return ref_->has_value();
     }
     Value const&
     read() const
@@ -1570,9 +1539,9 @@ struct signal_ref : signal<signal_ref<Value, Direction>, Value, Direction>
         return ref_->value_id();
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return ref_->is_writable();
+        return ref_->ready_to_write();
     }
     void
     write(Value const& value) const
@@ -1606,12 +1575,12 @@ struct is_signal_type : std::is_base_of<untyped_signal_base, T>
 {
 };
 
-// signal_can_read<Signal>::value yields a compile-time boolean indicating
+// signal_is_readable<Signal>::value yields a compile-time boolean indicating
 // whether or not the given signal type supports reading.
 template<class Signal>
-struct signal_can_read : signal_direction_is_compatible<
-                             read_only_signal,
-                             typename Signal::direction_tag>
+struct signal_is_readable : signal_direction_is_compatible<
+                                read_only_signal,
+                                typename Signal::direction_tag>
 {
 };
 
@@ -1620,41 +1589,41 @@ struct signal_can_read : signal_direction_is_compatible<
 template<class T>
 struct is_readable_signal_type : std::conditional_t<
                                      is_signal_type<T>::value,
-                                     signal_can_read<T>,
+                                     signal_is_readable<T>,
                                      std::false_type>
 {
 };
 
-// Is :signal currently readable?
-// Unlike calling signal.is_readable() directly, this will generate a
+// Does :signal currently have a value?
+// Unlike calling signal.has_value() directly, this will generate a
 // compile-time error if the signal's type doesn't support reading.
 template<class Signal>
-std::enable_if_t<signal_can_read<Signal>::value, bool>
-signal_is_readable(Signal const& signal)
+std::enable_if_t<signal_is_readable<Signal>::value, bool>
+signal_has_value(Signal const& signal)
 {
-    return signal.is_readable();
+    return signal.has_value();
 }
 
 // Read a signal's value.
 // Unlike calling signal.read() directly, this will generate a compile-time
 // error if the signal's type doesn't support reading and a run-time error if
-// the signal isn't currently readable.
+// the signal doesn't currently have a value.
 template<class Signal>
 std::enable_if_t<
-    signal_can_read<Signal>::value,
+    signal_is_readable<Signal>::value,
     typename Signal::value_type const&>
 read_signal(Signal const& signal)
 {
-    assert(signal.is_readable());
+    assert(signal.has_value());
     return signal.read();
 }
 
-// signal_can_write<Signal>::value yields a compile-time boolean indicating
+// signal_is_writable<Signal>::value yields a compile-time boolean indicating
 // whether or not the given signal type supports writing.
 template<class Signal>
-struct signal_can_write : signal_direction_is_compatible<
-                              write_only_signal,
-                              typename Signal::direction_tag>
+struct signal_is_writable : signal_direction_is_compatible<
+                                write_only_signal,
+                                typename Signal::direction_tag>
 {
 };
 
@@ -1663,30 +1632,30 @@ struct signal_can_write : signal_direction_is_compatible<
 template<class T>
 struct is_writable_signal_type : std::conditional_t<
                                      is_signal_type<T>::value,
-                                     signal_can_write<T>,
+                                     signal_is_writable<T>,
                                      std::false_type>
 {
 };
 
-// Is :signal currently writable?
-// Unlike calling signal.is_writable() directly, this will generate a
+// Is :signal ready to write?
+// Unlike calling signal.ready_to_write() directly, this will generate a
 // compile-time error if the signal's type doesn't support writing.
 template<class Signal>
-std::enable_if_t<signal_can_write<Signal>::value, bool>
-signal_is_writable(Signal const& signal)
+std::enable_if_t<signal_is_writable<Signal>::value, bool>
+signal_ready_to_write(Signal const& signal)
 {
-    return signal.is_writable();
+    return signal.ready_to_write();
 }
 
 // Write a signal's value.
 // Unlike calling signal.write() directly, this will generate a compile-time
 // error if the signal's type doesn't support writing and a run-time error if
-// the signal isn't currently writable.
+// the signal isn't currently ready to write.
 template<class Signal, class Value>
-std::enable_if_t<signal_can_write<Signal>::value>
+std::enable_if_t<signal_is_writable<Signal>::value>
 write_signal(Signal const& signal, Value const& value)
 {
-    assert(signal.is_writable());
+    assert(signal.ready_to_write());
     signal.write(value);
 }
 
@@ -1711,7 +1680,487 @@ struct is_bidirectional_signal_type : std::conditional_t<
 {
 };
 
+// When a value is written to a signal, the signal is allowed to throw a
+// validation_error if the value isn't acceptable.
+struct validation_error : exception
+{
+    validation_error(std::string const& message) : exception(message)
+    {
+    }
+    ~validation_error() noexcept(true)
+    {
+    }
+};
+
 } // namespace alia
+
+
+
+// This file defines various utilities for working with signals.
+// (These are mostly meant to be used internally.)
+
+namespace alia {
+
+// regular_signal is a partial implementation of the signal interface for
+// cases where the value ID of the signal is simply the value itself.
+template<class Derived, class Value, class Direction>
+struct regular_signal : signal<Derived, Value, Direction>
+{
+    id_interface const&
+    value_id() const
+    {
+        if (this->has_value())
+        {
+            id_ = make_id_by_reference(this->read());
+            return id_;
+        }
+        return null_id;
+    }
+
+ private:
+    mutable simple_id_by_reference<Value> id_;
+};
+
+// lazy_reader is used to create signals that lazily generate their values.
+// It provides storage for the computed value and ensures that it's only
+// computed once.
+template<class Value>
+struct lazy_reader
+{
+    lazy_reader() : already_generated_(false)
+    {
+    }
+    template<class Generator>
+    Value const&
+    read(Generator const& generator) const
+    {
+        if (!already_generated_)
+        {
+            value_ = generator();
+            already_generated_ = true;
+        }
+        return value_;
+    }
+
+ private:
+    mutable bool already_generated_;
+    mutable Value value_;
+};
+
+// signals_all_have_values(signal_a, signal_b, ...) is a variadic function that
+// returns true iff all its input signals have values.
+inline bool
+signals_all_have_values()
+{
+    return true;
+}
+template<class Signal, class... Rest>
+bool
+signals_all_have_values(Signal const& signal, Rest const&... rest)
+{
+    return signal_has_value(signal) && signals_all_have_values(rest...);
+}
+
+// When assigning value IDs for signals with value type Value, should we prefer
+// to use a simple ID?
+template<class Value>
+struct type_prefers_simple_id : std::is_fundamental<Value>
+{
+};
+
+// preferred_id_signal is used to decide whether to assign a 'simple' value ID
+// (one that is simply the value itself) when a more complex form is available.
+// The simple form will of course eliminate spurious ID changes, but for large
+// values, it might be unreasonably expensive, so this tries to use the simple
+// form only for value types where it would be appropriate.
+
+template<
+    class Derived,
+    class Value,
+    class Direction,
+    class ComplexId,
+    class = void>
+struct preferred_id_signal
+{
+};
+
+template<class Derived, class Value, class Direction, class ComplexId>
+struct preferred_id_signal<
+    Derived,
+    Value,
+    Direction,
+    ComplexId,
+    std::enable_if_t<type_prefers_simple_id<Value>::value>>
+    : signal<Derived, Value, Direction>
+{
+    id_interface const&
+    value_id() const
+    {
+        if (this->has_value())
+        {
+            id_ = make_id_by_reference(this->read());
+            return id_;
+        }
+        return null_id;
+    }
+
+ private:
+    mutable simple_id_by_reference<Value> id_;
+};
+
+template<class Derived, class Value, class Direction, class ComplexId>
+struct preferred_id_signal<
+    Derived,
+    Value,
+    Direction,
+    ComplexId,
+    std::enable_if_t<!type_prefers_simple_id<Value>::value>>
+    : signal<Derived, Value, Direction>
+{
+    id_interface const&
+    value_id() const
+    {
+        id_ = static_cast<Derived const*>(this)->complex_value_id();
+        return id_;
+    }
+
+ private:
+    mutable ComplexId id_;
+};
+
+} // namespace alia
+
+
+// This file defines various utilities for constructing basic signals.
+
+namespace alia {
+
+// empty<Value>() gives a signal that never has a value.
+template<class Value>
+struct empty_signal : signal<empty_signal<Value>, Value, bidirectional_signal>
+{
+    empty_signal()
+    {
+    }
+    id_interface const&
+    value_id() const
+    {
+        return null_id;
+    }
+    bool
+    has_value() const
+    {
+        return false;
+    }
+    // Since this never has a value, read() should never be called.
+    // LCOV_EXCL_START
+    Value const&
+    read() const
+    {
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wnull-dereference"
+#endif
+        return *(Value const*) nullptr;
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+    }
+    // LCOV_EXCL_STOP
+    bool
+    ready_to_write() const
+    {
+        return false;
+    }
+    // Since this is never ready to write, write() should never be called.
+    // LCOV_EXCL_START
+    void
+    write(Value const&) const
+    {
+    }
+    // LCOV_EXCL_STOP
+};
+template<class Value>
+empty_signal<Value>
+empty()
+{
+    return empty_signal<Value>();
+}
+
+// value(v) creates a read-only signal that carries the value v.
+template<class Value>
+struct value_signal
+    : regular_signal<value_signal<Value>, Value, read_only_signal>
+{
+    explicit value_signal(Value const& v) : v_(v)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return true;
+    }
+    Value const&
+    read() const
+    {
+        return v_;
+    }
+
+ private:
+    Value v_;
+};
+template<class Value>
+value_signal<Value>
+value(Value const& v)
+{
+    return value_signal<Value>(v);
+}
+
+// This is a special overload of value() for C-style string literals.
+struct string_literal_signal
+    : signal<string_literal_signal, std::string, read_only_signal>
+{
+    string_literal_signal(char const* x) : text_(x)
+    {
+    }
+    id_interface const&
+    value_id() const
+    {
+        return unit_id;
+    }
+    bool
+    has_value() const
+    {
+        return true;
+    }
+    std::string const&
+    read() const
+    {
+        return lazy_reader_.read([&] { return std::string(text_); });
+    }
+
+ private:
+    char const* text_;
+    lazy_reader<std::string> lazy_reader_;
+};
+inline string_literal_signal
+value(char const* text)
+{
+    return string_literal_signal(text);
+}
+
+// literal operators
+namespace literals {
+inline string_literal_signal operator"" _a(char const* s, size_t)
+{
+    return string_literal_signal(s);
+}
+} // namespace literals
+
+// direct(x), where x is a non-const reference, creates a bidirectional signal
+// that directly exposes the value of x.
+template<class Value>
+struct direct_signal
+    : regular_signal<direct_signal<Value>, Value, bidirectional_signal>
+{
+    explicit direct_signal(Value* v) : v_(v)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return true;
+    }
+    Value const&
+    read() const
+    {
+        return *v_;
+    }
+    bool
+    ready_to_write() const
+    {
+        return true;
+    }
+    void
+    write(Value const& value) const
+    {
+        *v_ = value;
+    }
+
+ private:
+    Value* v_;
+};
+template<class Value>
+direct_signal<Value>
+direct(Value& x)
+{
+    return direct_signal<Value>(&x);
+}
+
+// direct(x), where x is a const reference, creates a read-only signal that
+// directly exposes the value of x.
+template<class Value>
+struct direct_const_signal
+    : regular_signal<direct_const_signal<Value>, Value, read_only_signal>
+{
+    explicit direct_const_signal(Value const* v) : v_(v)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return true;
+    }
+    Value const&
+    read() const
+    {
+        return *v_;
+    }
+
+ private:
+    Value const* v_;
+};
+template<class Value>
+direct_const_signal<Value>
+direct(Value const& x)
+{
+    return direct_const_signal<Value>(&x);
+}
+
+} // namespace alia
+
+
+namespace alia {
+
+struct data_traversal;
+ALIA_DEFINE_COMPONENT_TYPE(data_traversal_tag, data_traversal&)
+
+struct event_traversal;
+ALIA_DEFINE_COMPONENT_TYPE(event_traversal_tag, event_traversal&)
+
+struct system;
+ALIA_DEFINE_COMPONENT_TYPE(system_tag, system&)
+
+// the structure we use to store components - It provides direct storage of the
+// commonly-used components in the core of alia.
+
+struct context_component_storage
+{
+    // directly-stored components
+    system* sys = nullptr;
+    event_traversal* event = nullptr;
+    data_traversal* data = nullptr;
+
+    // generic storage for other components
+    generic_component_storage<any_ref> generic;
+
+    ALIA_IMPLEMENT_STORAGE_COMPONENT_ACCESSORS(context_component_storage)
+};
+
+ALIA_ADD_DIRECT_COMPONENT_ACCESS(context_component_storage, system_tag, sys)
+ALIA_ADD_DIRECT_COMPONENT_ACCESS(
+    context_component_storage, event_traversal_tag, event)
+ALIA_ADD_DIRECT_COMPONENT_ACCESS(
+    context_component_storage, data_traversal_tag, data)
+
+// the typedefs for the context - There are two because we want to be able to
+// represent the context with and without data capabilities.
+
+typedef add_component_type_t<
+    add_component_type_t<
+        empty_component_collection<context_component_storage>,
+        system_tag>,
+    event_traversal_tag>
+    dataless_context;
+
+typedef add_component_type_t<dataless_context, data_traversal_tag> context;
+
+// And some convenience functions...
+
+context
+make_context(
+    context_component_storage* storage,
+    system& sys,
+    event_traversal& event,
+    data_traversal& data);
+
+template<class Context>
+Context
+copy_context(Context ctx)
+{
+    context_component_storage* new_storage;
+    get_data(ctx, &new_storage);
+
+    Context new_ctx(new_storage);
+    *new_storage = *ctx.storage;
+
+    return new_ctx;
+}
+
+template<class Tag, class Context, class Data>
+auto
+extend_context(Context ctx, Data& data)
+{
+    return add_component<Tag>(ctx, std::ref(data));
+}
+
+template<class Collection, class... Tag>
+struct extend_context_type : add_component_types<Collection, Tag...>
+{
+};
+template<class Collection, class... Tag>
+using extend_context_type_t =
+    typename extend_context_type<Collection, Tag...>::type;
+
+template<class Context>
+event_traversal&
+get_event_traversal(Context ctx)
+{
+    return get_component<event_traversal_tag>(ctx);
+}
+
+template<class Context>
+data_traversal&
+get_data_traversal(Context ctx)
+{
+    return get_component<data_traversal_tag>(ctx);
+}
+
+// And some functions for accessing the context/system timing capabilities...
+
+// Currently, alia's only sense of time is that of a monotonically increasing
+// millisecond counter. It's understood to have an arbitrary start point and is
+// allowed to wrap around, so 'unsigned' is considered sufficient.
+typedef unsigned millisecond_count;
+
+// Request that the UI context refresh again quickly enough for smooth
+// animation.
+void
+request_animation_refresh(dataless_context ctx);
+
+// Get the value of the millisecond tick counter associated with the given
+// UI context. This counter is updated every refresh pass, so it's consistent
+// within a single frame.
+// When this is called, it's assumed that something is currently animating, so
+// it also requests a refresh.
+millisecond_count
+get_raw_animation_tick_count(dataless_context ctx);
+
+// Same as above, but returns a signal rather than a raw integer.
+value_signal<millisecond_count>
+get_animation_tick_count(dataless_context ctx);
+
+// Get the number of ticks remaining until the given end time.
+// If the time has passed, this returns 0.
+// This ensures that the UI context refreshes until the end time is reached.
+millisecond_count
+get_raw_animation_ticks_left(dataless_context ctx, millisecond_count end_tick);
+
+} // namespace alia
+
+
+#include <functional>
+
 
 #include <cassert>
 
@@ -2169,6 +2618,17 @@ get_data(Context& ctx, T** ptr)
     }
 }
 
+// This is a slightly more convenient form for when you don't care about
+// initializing the data at the call site.
+template<class Data, class Context>
+Data&
+get_data(Context& ctx)
+{
+    Data* data;
+    get_data(ctx, &data);
+    return *data;
+}
+
 // get_cached_data(ctx, &ptr) is identical to get_data(ctx, &ptr), but the
 // data stored in the node is understood to be a cached value of data that's
 // generated by the application. The system assumes that the data can be
@@ -2217,6 +2677,17 @@ get_cached_data(Context& ctx, T** ptr)
     holder->data = data;
     *ptr = &data->value;
     return true;
+}
+
+// This is a slightly more convenient form for when you don't care about
+// initializing the data at the call site.
+template<class Data, class Context>
+Data&
+get_cached_data(Context& ctx)
+{
+    Data* data;
+    get_cached_data(ctx, &data);
+    return *data;
 }
 
 // Clear all cached data stored within a data block.
@@ -2305,7 +2776,7 @@ struct keyed_data_signal
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
         return data_->is_valid;
     }
@@ -2317,10 +2788,10 @@ struct keyed_data_signal
     id_interface const&
     value_id() const
     {
-        return data_->key.is_initialized() ? data_->key.get() : no_id;
+        return data_->key.is_initialized() ? data_->key.get() : null_id;
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
         return true;
     }
@@ -2344,7 +2815,7 @@ make_signal(keyed_data<Data>* data)
 template<class Context, class Data>
 bool
 get_keyed_data(
-    Context& ctx, id_interface const& key, keyed_data_signal<Data>* signal)
+    Context ctx, id_interface const& key, keyed_data_signal<Data>* signal)
 {
     keyed_data<Data>* ptr;
     get_cached_data(ctx, &ptr);
@@ -2366,7 +2837,7 @@ struct raw_keyed_data
 
 template<class Context, class Data>
 bool
-get_keyed_data(Context& ctx, id_interface const& key, Data** data)
+get_keyed_data(Context ctx, id_interface const& key, Data** data)
 {
     raw_keyed_data<Data>* ptr;
     bool is_new = false;
@@ -2420,296 +2891,471 @@ struct scoped_data_traversal
 
 namespace alia {
 
+struct external_interface
+{
+    // alia calls this every frame when an animation is in progress.
+    virtual void
+    request_animation_refresh()
+    {
+    }
+};
+
 struct system
 {
     data_graph data;
     std::function<void(context)> controller;
+    millisecond_count tick_counter = 0;
+    bool automatic_time_updates = true;
+    bool refresh_needed = false;
+    external_interface* external = nullptr;
 };
 
 void
 refresh_system(system& sys);
 
-} // namespace alia
+void
+refresh_system_time(system& sys);
 
-
-
-
-
-// This file defines various utilities for working with signals.
-// (These are mostly meant to be used internally.)
-
-namespace alia {
-
-// regular_signal is a partial implementation of the signal interface for
-// cases where the value ID of the signal is simply the value itself.
-template<class Derived, class Value, class Direction>
-struct regular_signal : signal<Derived, Value, Direction>
+inline void
+set_automatic_time_updates(system& sys, bool enabled)
 {
-    id_interface const&
-    value_id() const
-    {
-        if (this->is_readable())
-        {
-            id_ = make_id_by_reference(this->read());
-            return id_;
-        }
-        return no_id;
-    }
-
- private:
-    mutable simple_id_by_reference<Value> id_;
-};
-
-// lazy_reader is used to create signals that lazily generate their values.
-// It provides storage for the computed value and ensures that it's only
-// computed once.
-template<class Value>
-struct lazy_reader
-{
-    lazy_reader() : already_generated_(false)
-    {
-    }
-    template<class Generator>
-    Value const&
-    read(Generator const& generator) const
-    {
-        if (!already_generated_)
-        {
-            value_ = generator();
-            already_generated_ = true;
-        }
-        return value_;
-    }
-
- private:
-    mutable bool already_generated_;
-    mutable Value value_;
-};
-
-// signals_all_readable(signal_a, signal_b, ...) is a variadic function that
-// returns true iff all its input signals are readable.
-static inline bool
-signals_all_readable()
-{
-    return true;
+    sys.automatic_time_updates = enabled;
 }
-template<class Signal, class... Rest>
-bool
-signals_all_readable(Signal const& signal, Rest const&... rest)
+
+inline void
+set_millisecond_tick_counter(system& sys, millisecond_count count)
 {
-    return signal_is_readable(signal) && signals_all_readable(rest...);
+    sys.tick_counter = count;
+}
+
+inline bool
+system_needs_refresh(system const& sys)
+{
+    return sys.refresh_needed;
 }
 
 } // namespace alia
 
 
-// This file defines various utilities for constructing basic signals.
+
+
 
 namespace alia {
 
-// empty<Value>() gives a signal that never has a value.
-template<class Value>
-struct empty_signal : signal<empty_signal<Value>, Value, bidirectional_signal>
+// signalize(x) turns x into a signal if it isn't already one.
+// Or, in other words...
+// signalize(s), where s is a signal, returns s.
+// signalize(v), where v is a raw value, returns a value signal carrying s.
+template<class Signal>
+std::enable_if_t<is_readable_signal_type<Signal>::value, Signal>
+signalize(Signal s)
 {
-    empty_signal()
+    return s;
+}
+template<class Value, std::enable_if_t<!is_signal_type<Value>::value, int> = 0>
+auto
+signalize(Value v)
+{
+    return value(std::move(v));
+}
+
+// fake_readability(s), where :s is a signal, yields a wrapper for :s that
+// pretends to have read capabilities. It will never actually have a value, but
+// it will type-check as a readable signal.
+template<class Wrapped>
+struct readability_faker : signal<
+                               readability_faker<Wrapped>,
+                               typename Wrapped::value_type,
+                               typename signal_direction_union<
+                                   read_only_signal,
+                                   typename Wrapped::direction_tag>::type>
+{
+    readability_faker(Wrapped wrapped) : wrapped_(wrapped)
     {
     }
     id_interface const&
     value_id() const
     {
-        return no_id;
+        return null_id;
     }
     bool
-    is_readable() const
+    has_value() const
     {
         return false;
     }
-    // Since this is never readable, read() should never be called.
+    // Since this is only faking readability, read() should never be called.
     // LCOV_EXCL_START
-    Value const&
+    typename Wrapped::value_type const&
     read() const
     {
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wnull-dereference"
 #endif
-        return *(Value const*) nullptr;
+        return *(typename Wrapped::value_type const*) nullptr;
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
     }
     // LCOV_EXCL_STOP
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return false;
+        return wrapped_.ready_to_write();
     }
-    // Since this is never writable, write() should never be called.
-    // LCOV_EXCL_START
     void
-    write(Value const& value) const
+    write(typename Wrapped::value_type const& value) const
     {
-    }
-    // LCOV_EXCL_STOP
-};
-template<class Value>
-empty_signal<Value>
-empty()
-{
-    return empty_signal<Value>();
-}
-
-// val(v) creates a read-only signal that carries the value v.
-template<class Value>
-struct value_signal
-    : regular_signal<value_signal<Value>, Value, read_only_signal>
-{
-    explicit value_signal(Value const& v) : v_(v)
-    {
-    }
-    bool
-    is_readable() const
-    {
-        return true;
-    }
-    Value const&
-    read() const
-    {
-        return v_;
+        return wrapped_.write(value);
     }
 
  private:
-    Value v_;
+    Wrapped wrapped_;
 };
-template<class Value>
-value_signal<Value>
-val(Value const& v)
+template<class Wrapped>
+readability_faker<Wrapped>
+fake_readability(Wrapped const& wrapped)
 {
-    return value_signal<Value>(v);
+    return readability_faker<Wrapped>(wrapped);
 }
 
-// This is a special overload of val() for C-style string literals.
-struct string_literal_signal
-    : signal<string_literal_signal, std::string, read_only_signal>
+// fake_writability(s), where :s is a signal, yields a wrapper for :s that
+// pretends to have write capabilities. It will never actually be ready to
+// write, but it will type-check as a writable signal.
+template<class Wrapped>
+struct writability_faker : signal<
+                               writability_faker<Wrapped>,
+                               typename Wrapped::value_type,
+                               typename signal_direction_union<
+                                   write_only_signal,
+                                   typename Wrapped::direction_tag>::type>
 {
-    string_literal_signal(char const* x) : text_(x)
+    writability_faker(Wrapped wrapped) : wrapped_(wrapped)
     {
     }
     id_interface const&
     value_id() const
     {
-        return unit_id;
+        return wrapped_.value_id();
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return true;
+        return wrapped_.has_value();
     }
-    std::string const&
+    typename Wrapped::value_type const&
     read() const
     {
-        return lazy_reader_.read([&] { return std::string(text_); });
+        return wrapped_.read();
     }
+    bool
+    ready_to_write() const
+    {
+        return false;
+    }
+    // Since this is only faking writability, write() should never be called.
+    // LCOV_EXCL_START
+    void
+    write(typename Wrapped::value_type const&) const
+    {
+    }
+    // LCOV_EXCL_STOP
 
  private:
-    char const* text_;
-    lazy_reader<std::string> lazy_reader_;
+    Wrapped wrapped_;
 };
-inline string_literal_signal
-val(char const* text)
+template<class Wrapped>
+writability_faker<Wrapped>
+fake_writability(Wrapped const& wrapped)
 {
-    return string_literal_signal(text);
+    return writability_faker<Wrapped>(wrapped);
 }
 
-// literal operators
-namespace literals {
-inline value_signal<unsigned long long int>
-operator"" _a(unsigned long long int n)
+// signal_cast<Value>(x), where :x is a signal, yields a proxy for :x with
+// the value type :Value. The proxy will apply static_casts to convert its
+// own values to and from :x's value type.
+template<class Wrapped, class To>
+struct signal_caster : regular_signal<
+                           signal_caster<Wrapped, To>,
+                           To,
+                           typename Wrapped::direction_tag>
 {
-    return val(n);
-}
-inline value_signal<long double> operator"" _a(long double n)
-{
-    return val(n);
-}
-inline string_literal_signal operator"" _a(char const* s, size_t n)
-{
-    return string_literal_signal(s);
-}
-} // namespace literals
-
-// direct(x), where x is a non-const reference, creates a bidirectional signal
-// that directly exposes the value of x.
-template<class Value>
-struct direct_signal
-    : regular_signal<direct_signal<Value>, Value, bidirectional_signal>
-{
-    explicit direct_signal(Value* v) : v_(v)
+    signal_caster(Wrapped wrapped) : wrapped_(wrapped)
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return true;
+        return wrapped_.has_value();
     }
-    Value const&
+    To const&
     read() const
     {
-        return *v_;
+        return lazy_reader_.read(
+            [&] { return static_cast<To>(wrapped_.read()); });
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return true;
+        return wrapped_.ready_to_write();
     }
     void
-    write(Value const& value) const
+    write(To const& value) const
     {
-        *v_ = value;
+        return wrapped_.write(static_cast<typename Wrapped::value_type>(value));
     }
 
  private:
-    Value* v_;
+    Wrapped wrapped_;
+    lazy_reader<To> lazy_reader_;
 };
-template<class Value>
-direct_signal<Value>
-direct(Value& x)
+template<class To, class Wrapped>
+signal_caster<Wrapped, To>
+signal_cast(Wrapped const& wrapped)
 {
-    return direct_signal<Value>(&x);
+    return signal_caster<Wrapped, To>(wrapped);
 }
 
-// direct(x), where x is a const reference, creates a read-only signal that
-// directly exposes the value of x.
-template<class Value>
-struct direct_const_signal
-    : regular_signal<direct_const_signal<Value>, Value, read_only_signal>
+// has_value(x) yields a signal to a boolean which indicates whether or not :x
+// has a value. (The returned signal itself always has a value.)
+template<class Wrapped>
+struct value_presence_signal
+    : regular_signal<value_presence_signal<Wrapped>, bool, read_only_signal>
 {
-    explicit direct_const_signal(Value const* v) : v_(v)
+    value_presence_signal(Wrapped const& wrapped) : wrapped_(wrapped)
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
         return true;
     }
-    Value const&
+    bool const&
     read() const
     {
-        return *v_;
+        value_ = wrapped_.has_value();
+        return value_;
     }
 
  private:
-    Value const* v_;
+    Wrapped wrapped_;
+    mutable bool value_;
 };
-template<class Value>
-direct_const_signal<Value>
-direct(Value const& x)
+template<class Wrapped>
+auto
+has_value(Wrapped const& wrapped)
 {
-    return direct_const_signal<Value>(&x);
+    return value_presence_signal<Wrapped>(wrapped);
+}
+
+// ready_to_write(x) yields a signal to a boolean that indicates whether or not
+// :x is ready to write. (The returned signal always has a value.)
+template<class Wrapped>
+struct write_readiness_signal
+    : regular_signal<write_readiness_signal<Wrapped>, bool, read_only_signal>
+{
+    write_readiness_signal(Wrapped const& wrapped) : wrapped_(wrapped)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return true;
+    }
+    bool const&
+    read() const
+    {
+        value_ = wrapped_.ready_to_write();
+        return value_;
+    }
+
+ private:
+    Wrapped wrapped_;
+    mutable bool value_;
+};
+template<class Wrapped>
+auto
+ready_to_write(Wrapped const& wrapped)
+{
+    return write_readiness_signal<Wrapped>(wrapped);
+}
+
+// add_fallback(primary, fallback), where :primary and :fallback are both
+// signals, yields another signal whose value is that of :primary if it has one
+// and that of :fallback otherwise.
+// All writes go directly to :primary.
+template<class Primary, class Fallback>
+struct fallback_signal : signal<
+                             fallback_signal<Primary, Fallback>,
+                             typename Primary::value_type,
+                             typename Primary::direction_tag>
+{
+    fallback_signal()
+    {
+    }
+    fallback_signal(Primary primary, Fallback fallback)
+        : primary_(primary), fallback_(fallback)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return primary_.has_value() || fallback_.has_value();
+    }
+    typename Primary::value_type const&
+    read() const
+    {
+        return primary_.has_value() ? primary_.read() : fallback_.read();
+    }
+    id_interface const&
+    value_id() const
+    {
+        id_ = combine_ids(
+            make_id(primary_.has_value()),
+            primary_.has_value() ? ref(primary_.value_id())
+                                 : ref(fallback_.value_id()));
+        return id_;
+    }
+    bool
+    ready_to_write() const
+    {
+        return primary_.ready_to_write();
+    }
+    void
+    write(typename Primary::value_type const& value) const
+    {
+        primary_.write(value);
+    }
+
+ private:
+    mutable id_pair<simple_id<bool>, id_ref> id_;
+    Primary primary_;
+    Fallback fallback_;
+};
+template<class Primary, class Fallback>
+fallback_signal<Primary, Fallback>
+make_fallback_signal(Primary primary, Fallback fallback)
+{
+    return fallback_signal<Primary, Fallback>(primary, fallback);
+}
+template<class Primary, class Fallback>
+auto
+add_fallback(Primary primary, Fallback fallback)
+{
+    return make_fallback_signal(signalize(primary), signalize(fallback));
+}
+
+// simplify_id(s), where :s is a signal, yields a wrapper for :s with the exact
+// same read/write behavior but whose value ID is a simple_id (i.e., it is
+// simply the value of the signal).
+//
+// The main utility of this is in cases where you have a signal carrying a
+// small value with a complicated value ID (because it was picked from the
+// signal of a larger data structure, for example). The more complicated ID
+// might change superfluously.
+//
+template<class Wrapped>
+struct simplified_id_wrapper : regular_signal<
+                                   simplified_id_wrapper<Wrapped>,
+                                   typename Wrapped::value_type,
+                                   typename Wrapped::direction_tag>
+{
+    simplified_id_wrapper(Wrapped wrapped) : wrapped_(wrapped)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return wrapped_.has_value();
+    }
+    typename Wrapped::value_type const&
+    read() const
+    {
+        return wrapped_.read();
+    }
+    bool
+    ready_to_write() const
+    {
+        return wrapped_.ready_to_write();
+    }
+    void
+    write(typename Wrapped::value_type const& value) const
+    {
+        return wrapped_.write(value);
+    }
+
+ private:
+    Wrapped wrapped_;
+};
+template<class Wrapped>
+simplified_id_wrapper<Wrapped>
+simplify_id(Wrapped wrapped)
+{
+    return simplified_id_wrapper<Wrapped>(wrapped);
+}
+
+// mask(signal, condition) does the equivalent of bit masking on individual
+// signals. If :condition evaluates to true, the mask evaluates to :signal.
+// Otherwise, it evaluates to an empty signal of the same type.
+template<class Primary, class Mask>
+struct masking_signal : signal<
+                            masking_signal<Primary, Mask>,
+                            typename Primary::value_type,
+                            typename Primary::direction_tag>
+{
+    masking_signal()
+    {
+    }
+    masking_signal(Primary primary, Mask mask) : primary_(primary), mask_(mask)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return mask_.has_value() && mask_.read() && primary_.has_value();
+    }
+    typename Primary::value_type const&
+    read() const
+    {
+        return primary_.read();
+    }
+    id_interface const&
+    value_id() const
+    {
+        if (mask_.has_value() && mask_.read())
+            return primary_.value_id();
+        else
+            return null_id;
+    }
+    bool
+    ready_to_write() const
+    {
+        return mask_.has_value() && mask_.read() && primary_.ready_to_write();
+    }
+    void
+    write(typename Primary::value_type const& value) const
+    {
+        primary_.write(value);
+    }
+
+ private:
+    Primary primary_;
+    Mask mask_;
+};
+template<class Signal, class Condition>
+auto
+make_masking_signal(Signal signal, Condition condition)
+{
+    return masking_signal<Signal, Condition>(signal, condition);
+}
+template<class Signal, class Condition>
+auto
+mask(Signal signal, Condition condition)
+{
+    return make_masking_signal(signalize(signal), signalize(condition));
 }
 
 } // namespace alia
-
 
 
 
@@ -2778,30 +3424,30 @@ struct loop_block : noncopyable
 // underscore and assumes that the context is a variable named 'ctx'.
 
 // condition_is_true(x), where x is a signal whose value is testable in a
-// boolean context, returns true iff x is readable and its value is true.
+// boolean context, returns true iff x has a value and that value is true.
 template<class Signal>
 std::enable_if_t<is_readable_signal_type<Signal>::value, bool>
 condition_is_true(Signal const& x)
 {
-    return signal_is_readable(x) && (read_signal(x) ? true : false);
+    return signal_has_value(x) && (read_signal(x) ? true : false);
 }
 
 // condition_is_false(x), where x is a signal whose value is testable in a
-// boolean context, returns true iff x is readable and its value is false.
+// boolean context, returns true iff x has a value and that value is false.
 template<class Signal>
 std::enable_if_t<is_readable_signal_type<Signal>::value, bool>
 condition_is_false(Signal const& x)
 {
-    return signal_is_readable(x) && (read_signal(x) ? false : true);
+    return signal_has_value(x) && (read_signal(x) ? false : true);
 }
 
-// condition_is_readable(x), where x is a readable signal type, calls
-// signal_is_readable.
+// condition_has_value(x), where x is a readable signal type, calls
+// signal_has_value.
 template<class Signal>
 std::enable_if_t<is_readable_signal_type<Signal>::value, bool>
-condition_is_readable(Signal const& x)
+condition_has_value(Signal const& x)
 {
-    return signal_is_readable(x);
+    return signal_has_value(x);
 }
 
 // read_condition(x), where x is a readable signal type, calls read_signal.
@@ -2813,10 +3459,6 @@ read_condition(Signal const& x)
 {
     return read_signal(x);
 }
-
-// ALIA_STRICT_CONDITIONALS disables the definitions that allow non-signals to
-// be used in if/else/switch macros.
-#ifndef ALIA_STRICT_CONDITIONALS
 
 // condition_is_true(x) evaluates x in a boolean context.
 template<class T>
@@ -2834,10 +3476,10 @@ condition_is_false(T x)
     return x ? false : true;
 }
 
-// condition_is_readable(x), where x is NOT a signal type, always returns true.
+// condition_has_value(x), where x is NOT a signal type, always returns true.
 template<class T>
 std::enable_if_t<!is_signal_type<T>::value, bool>
-condition_is_readable(T const& x)
+condition_has_value(T const&)
 {
     return true;
 }
@@ -2850,11 +3492,23 @@ read_condition(T const& x)
     return x;
 }
 
+// MSVC likes to warn about shadowed local variables and function parameters,
+// but there's really no way to implement these macros without potentially
+// shadowing things, so we need to disable those warning within the macros.
+#ifdef _MSC_VER
+#define ALIA_DISABLE_MACRO_WARNINGS                                            \
+    __pragma(warning(push)) __pragma(warning(disable : 4456))                  \
+        __pragma(warning(disable : 4457))
+#define ALIA_UNDISABLE_MACRO_WARNINGS __pragma(warning(pop))
+#else
+#define ALIA_DISABLE_MACRO_WARNINGS
+#define ALIA_UNDISABLE_MACRO_WARNINGS
 #endif
 
 // if, else_if, else
 
 #define ALIA_IF_(ctx, condition)                                               \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     {                                                                          \
         bool _alia_else_condition ALIA_UNUSED;                                 \
         {                                                                      \
@@ -2866,11 +3520,13 @@ read_condition(T const& x)
             ::alia::if_block _alia_if_block(                                   \
                 get_data_traversal(ctx), _alia_if_condition);                  \
             if (_alia_if_condition)                                            \
-            {
+            {                                                                  \
+                ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_IF(condition) ALIA_IF_(ctx, condition)
 
 #define ALIA_ELSE_IF_(ctx, condition)                                          \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     }                                                                          \
     }                                                                          \
     {                                                                          \
@@ -2883,22 +3539,25 @@ read_condition(T const& x)
         ::alia::if_block _alia_if_block(                                       \
             get_data_traversal(ctx), _alia_else_if_condition);                 \
         if (_alia_else_if_condition)                                           \
-        {
+        {                                                                      \
+            ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_ELSE_IF(condition) ALIA_ELSE_IF_(ctx, condition)
 
 #define ALIA_ELSE_(ctx)                                                        \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     }                                                                          \
     }                                                                          \
     {                                                                          \
         ::alia::if_block _alia_if_block(                                       \
             get_data_traversal(ctx), _alia_else_condition);                    \
         if (_alia_else_condition)                                              \
-        {
+        {                                                                      \
+            ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_ELSE ALIA_ELSE_(ctx)
 
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 #define alia_if_(ctx, condition) ALIA_IF_(ctx, condition)
 #define alia_if(condition) ALIA_IF(condition)
 #define alia_else_if_(ctx, condition) ALIA_ELSE_IF_(ctx, condition)
@@ -2910,12 +3569,15 @@ read_condition(T const& x)
 // switch
 
 #define ALIA_SWITCH_(ctx, x)                                                   \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     {                                                                          \
         ::alia::switch_block _alia_switch_block(ctx);                          \
-        if (::alia::condition_is_readable(x))                                  \
+        auto const& _alia_switch_value = (x);                                  \
+        if (::alia::condition_has_value(_alia_switch_value))                   \
         {                                                                      \
-            switch (::alia::read_condition(x))                                 \
-            {
+            switch (::alia::read_condition(_alia_switch_value))                \
+            {                                                                  \
+                ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_SWITCH(x) ALIA_SWITCH_(ctx, x)
 
@@ -2938,7 +3600,7 @@ read_condition(T const& x)
 
 #define ALIA_DEFAULT ALIA_DEFAULT_(ctx)
 
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 #define alia_switch_(ctx, x) ALIA_SWITCH_(ctx, x)
 #define alia_switch(x) ALIA_SWITCH(x)
 #define alia_case_(ctx, c) ALIA_CASE(ctx, c)
@@ -2950,6 +3612,7 @@ read_condition(T const& x)
 // for
 
 #define ALIA_FOR_(ctx, x)                                                      \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     {                                                                          \
         {                                                                      \
             ::alia::loop_block _alia_looper(get_data_traversal(ctx));          \
@@ -2958,11 +3621,12 @@ read_condition(T const& x)
                 ::alia::scoped_data_block _alia_scope;                         \
                 _alia_scope.begin(                                             \
                     _alia_looper.traversal(), _alia_looper.block());           \
-                _alia_looper.next();
+                _alia_looper.next();                                           \
+                ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_FOR(x) ALIA_FOR_(ctx, x)
 
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 #define alia_for_(ctx, x) ALIA_FOR_(ctx, x)
 #define alia_for(x) ALIA_FOR(x)
 #endif
@@ -2970,6 +3634,7 @@ read_condition(T const& x)
 // while
 
 #define ALIA_WHILE_(ctx, x)                                                    \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     {                                                                          \
         {                                                                      \
             ::alia::loop_block _alia_looper(get_data_traversal(ctx));          \
@@ -2978,11 +3643,12 @@ read_condition(T const& x)
                 ::alia::scoped_data_block _alia_scope;                         \
                 _alia_scope.begin(                                             \
                     _alia_looper.traversal(), _alia_looper.block());           \
-                _alia_looper.next();
+                _alia_looper.next();                                           \
+                ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_WHILE(x) ALIA_WHILE_(ctx, x)
 
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 #define alia_while_(ctx, x) ALIA_WHILE_(ctx, x)
 #define alia_while(x) ALIA_WHILE(x)
 #endif
@@ -2994,7 +3660,7 @@ read_condition(T const& x)
     }                                                                          \
     }
 
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 #define alia_end ALIA_END
 #endif
 
@@ -3005,10 +3671,12 @@ read_condition(T const& x)
 // in an error (as it should).
 
 #define ALIA_REMOVE_DATA_TRACKING(ctx)                                         \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     typename decltype(ctx)::storage_type _alia_storage;                        \
     auto _alia_ctx                                                             \
         = alia::remove_component<data_traversal_tag>(ctx, &_alia_storage);     \
-    auto ctx = _alia_ctx;
+    auto ctx = _alia_ctx;                                                      \
+    ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_UNTRACKED_IF_(ctx, condition)                                     \
     if (alia::condition_is_true(condition))                                    \
@@ -3044,7 +3712,7 @@ read_condition(T const& x)
 
 #define ALIA_UNTRACKED_ELSE ALIA_UNTRACKED_ELSE_(ctx)
 
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 
 #define alia_untracked_if_(ctx, condition) ALIA_UNTRACKED_IF_(ctx, condition)
 #define alia_untracked_if(condition) ALIA_UNTRACKED_IF(condition)
@@ -3057,17 +3725,19 @@ read_condition(T const& x)
 #endif
 
 #define ALIA_UNTRACKED_SWITCH_(ctx, expression)                                \
+    ALIA_DISABLE_MACRO_WARNINGS                                                \
     {                                                                          \
         {                                                                      \
-            auto _alia_value = (expression);                                   \
+            auto const& _alia_switch_value = (expression);                     \
             ALIA_REMOVE_DATA_TRACKING(ctx)                                     \
-            switch (_alia_value)                                               \
-            {
+            switch (_alia_switch_value)                                        \
+            {                                                                  \
+                ALIA_UNDISABLE_MACRO_WARNINGS
 
 #define ALIA_UNTRACKED_SWITCH(expression)                                      \
     ALIA_UNTRACKED_SWITCH_(ctx, expression)
 
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 
 #define alia_untracked_switch_(ctx, x) ALIA_UNTRACKED_SWITCH_(ctx, x)
 #define alia_untracked_switch(x) ALIA_UNTRACKED_SWITCH(x)
@@ -3115,9 +3785,9 @@ struct event_routing_path
 
 struct event_traversal
 {
-    routing_region_ptr* active_region;
+    routing_region_ptr* active_region = 0;
     bool targeted;
-    event_routing_path* path_to_target;
+    event_routing_path* path_to_target = 0;
     std::type_info const* event_type;
     void* event;
 };
@@ -3143,9 +3813,7 @@ dispatch_targeted_event(
     system& sys, Event& event, routing_region_ptr const& target)
 {
     event_traversal traversal;
-    traversal.active_region = 0;
     traversal.targeted = true;
-    traversal.path_to_target = 0;
     traversal.event_type = &typeid(Event);
     traversal.event = &event;
     route_event(sys, traversal, target.get());
@@ -3156,13 +3824,18 @@ void
 dispatch_event(system& sys, Event& event)
 {
     event_traversal traversal;
-    traversal.active_region = 0;
     traversal.targeted = false;
-    traversal.path_to_target = 0;
     traversal.event_type = &typeid(Event);
     traversal.event = &event;
     route_event(sys, traversal, 0);
 }
+
+struct traversal_aborted
+{
+};
+
+void
+abort_traversal(dataless_context ctx);
 
 struct scoped_routing_region
 {
@@ -3226,12 +3899,10 @@ struct node_identity
 };
 typedef node_identity const* node_id;
 
-static inline node_id
+inline node_id
 get_node_id(context ctx)
 {
-    node_identity* id;
-    get_cached_data(ctx, &id);
-    return id;
+    return &get_cached_data<node_identity>(ctx);
 }
 
 // routable_node_id identifies a node with enough information that an event can
@@ -3242,7 +3913,7 @@ struct routable_node_id
     routing_region_ptr region;
 };
 
-static inline routable_node_id
+inline routable_node_id
 make_routable_node_id(dataless_context ctx, node_id id)
 {
     routable_node_id routable;
@@ -3255,7 +3926,7 @@ static routable_node_id const null_node_id;
 
 // Is the given routable_node_id valid?
 // (Only the null_node_id is invalid.)
-static inline bool
+inline bool
 is_valid(routable_node_id const& id)
 {
     return id.id != nullptr;
@@ -3289,6 +3960,7 @@ handle_targeted_event(Context ctx, node_id id, Handler&& handler)
     ALIA_UNTRACKED_IF(detect_targeted_event(ctx, id, &e))
     {
         handler(ctx, *e);
+        abort_traversal(ctx);
     }
     ALIA_END
 }
@@ -3299,7 +3971,7 @@ struct refresh_event
 {
 };
 
-static inline bool
+inline bool
 is_refresh_event(dataless_context ctx)
 {
     refresh_event* e;
@@ -3323,7 +3995,7 @@ struct lazy_apply1_signal : signal<
                                 Result,
                                 read_only_signal>
 {
-    lazy_apply1_signal(Function const& f, Arg const& arg) : f_(f), arg_(arg)
+    lazy_apply1_signal(Function f, Arg arg) : f_(f), arg_(arg)
     {
     }
     id_interface const&
@@ -3332,9 +4004,9 @@ struct lazy_apply1_signal : signal<
         return arg_.value_id();
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return arg_.is_readable();
+        return arg_.has_value();
     }
     Result const&
     read() const
@@ -3349,7 +4021,7 @@ struct lazy_apply1_signal : signal<
 };
 template<class Function, class Arg>
 auto
-lazy_apply(Function const& f, Arg const& arg)
+lazy_apply(Function f, Arg arg)
 {
     return lazy_apply1_signal<decltype(f(read_signal(arg))), Function, Arg>(
         f, arg);
@@ -3362,7 +4034,7 @@ struct lazy_apply2_signal
           Result,
           read_only_signal>
 {
-    lazy_apply2_signal(Function const& f, Arg0 const& arg0, Arg1 const& arg1)
+    lazy_apply2_signal(Function f, Arg0 arg0, Arg1 arg1)
         : f_(f), arg0_(arg0), arg1_(arg1)
     {
     }
@@ -3373,9 +4045,9 @@ struct lazy_apply2_signal
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return arg0_.is_readable() && arg1_.is_readable();
+        return arg0_.has_value() && arg1_.has_value();
     }
     Result const&
     read() const
@@ -3393,7 +4065,7 @@ struct lazy_apply2_signal
 };
 template<class Function, class Arg0, class Arg1>
 auto
-lazy_apply(Function const& f, Arg0 const& arg0, Arg1 const& arg1)
+lazy_apply(Function f, Arg0 arg0, Arg1 arg1)
 {
     return lazy_apply2_signal<
         decltype(f(read_signal(arg0), read_signal(arg1))),
@@ -3404,7 +4076,7 @@ lazy_apply(Function const& f, Arg0 const& arg0, Arg1 const& arg1)
 
 template<class Function>
 auto
-lazy_lift(Function const& f)
+lazy_lift(Function f)
 {
     return [=](auto&&... args) { return lazy_apply(f, args...); };
 }
@@ -3452,7 +4124,7 @@ struct apply_signal : signal<apply_signal<Value>, Value, read_only_signal>
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
         return data_->status == apply_status::READY;
     }
@@ -3476,8 +4148,7 @@ make_apply_signal(apply_result_data<Value>& data)
 
 template<class Result>
 void
-process_apply_args(
-    context ctx, apply_result_data<Result>& data, bool& args_ready)
+process_apply_args(context, apply_result_data<Result>&, bool&)
 {
 }
 template<class Result, class Arg, class... Rest>
@@ -3493,7 +4164,7 @@ process_apply_args(
     get_cached_data(ctx, &cached_id);
     if (is_refresh_event(ctx))
     {
-        if (!signal_is_readable(arg))
+        if (!signal_has_value(arg))
         {
             reset(data);
             args_ready = false;
@@ -3509,7 +4180,7 @@ process_apply_args(
 
 template<class Function, class... Args>
 auto
-apply(context ctx, Function const& f, Args const&... args)
+apply(context ctx, Function f, Args const&... args)
 {
     apply_result_data<decltype(f(read_signal(args)...))>* data_ptr;
     get_cached_data(ctx, &data_ptr);
@@ -3536,16 +4207,17 @@ apply(context ctx, Function const& f, Args const&... args)
 
 template<class Function>
 auto
-lift(context ctx, Function const& f)
+lift(Function f)
 {
-    return [=](auto&&... args) { return apply(ctx, f, args...); };
+    return [=](context ctx, auto&&... args) { return apply(ctx, f, args...); };
 }
 
-// alia_method(m) wraps a method name in a lambda so that it can be passed as a
-// function object.
-#define ALIA_METHOD(m) [](auto&& x, auto&&... args) { return x.m(args...); }
-#ifdef ALIA_LOWERCASE_MACROS
-#define alia_method(m) ALIA_METHOD(m)
+// alia_mem_fn(m) wraps a member function name in a lambda so that it can be
+// passed as a function object. (It's the equivalent of std::mem_fn, but there's
+// no need to provide the type name.)
+#define ALIA_MEM_FN(m) [](auto&& x, auto&&... args) { return x.m(args...); }
+#ifndef ALIA_STRICT_MACROS
+#define alia_mem_fn(m) ALIA_MEM_FN(m)
 #endif
 
 } // namespace alia
@@ -3586,8 +4258,6 @@ ALIA_DEFINE_BINARY_SIGNAL_OPERATOR(>=)
 
 #undef ALIA_DEFINE_BINARY_SIGNAL_OPERATOR
 
-#ifndef ALIA_STRICT_OPERATORS
-
 #define ALIA_DEFINE_LIBERAL_BINARY_SIGNAL_OPERATOR(op)                         \
     template<                                                                  \
         class A,                                                               \
@@ -3597,7 +4267,7 @@ ALIA_DEFINE_BINARY_SIGNAL_OPERATOR(>=)
             int> = 0>                                                          \
     auto operator op(A const& a, B const& b)                                   \
     {                                                                          \
-        return lazy_apply([](auto a, auto b) { return a op b; }, a, val(b)); \
+        return lazy_apply([](auto a, auto b) { return a op b; }, a, value(b)); \
     }                                                                          \
     template<                                                                  \
         class A,                                                               \
@@ -3607,7 +4277,7 @@ ALIA_DEFINE_BINARY_SIGNAL_OPERATOR(>=)
             int> = 0>                                                          \
     auto operator op(A const& a, B const& b)                                   \
     {                                                                          \
-        return lazy_apply([](auto a, auto b) { return a op b; }, val(a), b); \
+        return lazy_apply([](auto a, auto b) { return a op b; }, value(a), b); \
     }
 
 ALIA_DEFINE_LIBERAL_BINARY_SIGNAL_OPERATOR(+)
@@ -3626,10 +4296,6 @@ ALIA_DEFINE_LIBERAL_BINARY_SIGNAL_OPERATOR(<)
 ALIA_DEFINE_LIBERAL_BINARY_SIGNAL_OPERATOR(<=)
 ALIA_DEFINE_LIBERAL_BINARY_SIGNAL_OPERATOR(>)
 ALIA_DEFINE_LIBERAL_BINARY_SIGNAL_OPERATOR(>=)
-
-#undef ALIA_DEFINE_LIBERAL_BINARY_SIGNAL_OPERATOR
-
-#endif
 
 #define ALIA_DEFINE_UNARY_SIGNAL_OPERATOR(op)                                  \
     template<class A, std::enable_if_t<is_signal_type<A>::value, int> = 0>     \
@@ -3661,20 +4327,20 @@ struct logical_or_signal
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        // Obviously, this is readable if both of its arguments are readable.
-        // However, it's also readable if only one is readable and its value is
-        // true.
-        return (arg0_.is_readable() && arg1_.is_readable())
-               || (arg0_.is_readable() && arg0_.read())
-               || (arg1_.is_readable() && arg1_.read());
+        // Obviously, this has a value if both of its arguments have values.
+        // However, we can also determine a value if only one input has a value
+        // but that value is true.
+        return (arg0_.has_value() && arg1_.has_value())
+               || (arg0_.has_value() && arg0_.read())
+               || (arg1_.has_value() && arg1_.read());
     }
     bool const&
     read() const
     {
-        value_ = (arg0_.is_readable() && arg0_.read())
-                 || (arg1_.is_readable() && arg1_.read());
+        value_ = (arg0_.has_value() && arg0_.read())
+                 || (arg1_.has_value() && arg1_.read());
         return value_;
     }
 
@@ -3696,8 +4362,6 @@ operator||(A const& a, B const& b)
     return logical_or_signal<A, B>(a, b);
 }
 
-#ifndef ALIA_STRICT_OPERATORS
-
 template<
     class A,
     class B,
@@ -3707,7 +4371,7 @@ template<
 auto
 operator||(A const& a, B const& b)
 {
-    return a || val(b);
+    return a || value(b);
 }
 template<
     class A,
@@ -3718,10 +4382,8 @@ template<
 auto
 operator||(A const& a, B const& b)
 {
-    return val(a) || b;
+    return value(a) || b;
 }
-
-#endif
 
 template<class Arg0, class Arg1>
 struct logical_and_signal
@@ -3738,21 +4400,21 @@ struct logical_and_signal
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        // Obviously, this is readable if both of its arguments are readable.
-        // However, it's also readable if only one is readable and its value is
-        // false.
-        return (arg0_.is_readable() && arg1_.is_readable())
-               || (arg0_.is_readable() && !arg0_.read())
-               || (arg1_.is_readable() && !arg1_.read());
+        // Obviously, this has a value if both of its arguments have values.
+        // However, we can also determine a value if only one input has a value
+        // but that value is false.
+        return (arg0_.has_value() && arg1_.has_value())
+               || (arg0_.has_value() && !arg0_.read())
+               || (arg1_.has_value() && !arg1_.read());
     }
     bool const&
     read() const
     {
         value_
-            = !((arg0_.is_readable() && !arg0_.read())
-                || (arg1_.is_readable() && !arg1_.read()));
+            = !((arg0_.has_value() && !arg0_.read())
+                || (arg1_.has_value() && !arg1_.read()));
         return value_;
     }
 
@@ -3774,8 +4436,6 @@ operator&&(A const& a, B const& b)
     return logical_and_signal<A, B>(a, b);
 }
 
-#ifndef ALIA_STRICT_OPERATORS
-
 template<
     class A,
     class B,
@@ -3785,7 +4445,7 @@ template<
 auto
 operator&&(A const& a, B const& b)
 {
-    return a && val(b);
+    return a && value(b);
 }
 template<
     class A,
@@ -3796,10 +4456,8 @@ template<
 auto
 operator&&(A const& a, B const& b)
 {
-    return val(a) && b;
+    return value(a) && b;
 }
-
-#endif
 
 // This is the equivalent of the ternary operator (or std::conditional) for
 // signals.
@@ -3827,10 +4485,10 @@ struct signal_mux : signal<
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return condition_.is_readable()
-               && (condition_.read() ? t_.is_readable() : f_.is_readable());
+        return condition_.has_value()
+               && (condition_.read() ? t_.has_value() : f_.has_value());
     }
     typename T::value_type const&
     read() const
@@ -3840,18 +4498,19 @@ struct signal_mux : signal<
     id_interface const&
     value_id() const
     {
-        if (!condition_.is_readable())
-            return no_id;
+        if (!condition_.has_value())
+            return null_id;
         id_ = combine_ids(
             make_id(condition_.read()),
             condition_.read() ? ref(t_.value_id()) : ref(f_.value_id()));
         return id_;
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return condition_.is_readable()
-               && (condition_.read() ? t_.is_writable() : f_.is_writable());
+        return condition_.has_value()
+               && (condition_.read() ? t_.ready_to_write()
+                                     : f_.ready_to_write());
     }
     void
     write(typename T::value_type const& value) const
@@ -3870,18 +4529,26 @@ struct signal_mux : signal<
 };
 template<class Condition, class T, class F>
 signal_mux<Condition, T, F>
-conditional(Condition const& condition, T const& t, F const& f)
+make_signal_mux(Condition condition, T t, F f)
 {
     return signal_mux<Condition, T, F>(condition, t, f);
+}
+
+template<class Condition, class T, class F>
+auto
+conditional(Condition condition, T t, F f)
+{
+    return make_signal_mux(signalize(condition), signalize(t), signalize(f));
 }
 
 // Given a signal to a structure, signal->*field_ptr returns a signal to the
 // specified field within the structure.
 template<class StructureSignal, class Field>
-struct field_signal : signal<
+struct field_signal : preferred_id_signal<
                           field_signal<StructureSignal, Field>,
                           Field,
-                          typename StructureSignal::direction_tag>
+                          typename StructureSignal::direction_tag,
+                          id_pair<id_ref, simple_id<Field*>>>
 {
     typedef typename StructureSignal::value_type structure_type;
     typedef Field structure_type::*field_ptr;
@@ -3890,9 +4557,9 @@ struct field_signal : signal<
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return structure_.is_readable();
+        return structure_.has_value();
     }
     Field const&
     read() const
@@ -3900,21 +4567,20 @@ struct field_signal : signal<
         structure_type const& structure = structure_.read();
         return structure.*field_;
     }
-    id_interface const&
-    value_id() const
+    auto
+    complex_value_id() const
     {
         // Apparently pointers-to-members aren't comparable for order, so
         // instead we use the address of the field if it were in a structure
         // that started at address 0.
-        id_ = combine_ids(
+        return combine_ids(
             ref(structure_.value_id()),
             make_id(&(((structure_type*) 0)->*field_)));
-        return id_;
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return structure_.is_readable() && structure_.is_writable();
+        return structure_.has_value() && structure_.ready_to_write();
     }
     void
     write(Field const& x) const
@@ -3927,7 +4593,6 @@ struct field_signal : signal<
  private:
     StructureSignal structure_;
     field_ptr field_;
-    mutable id_pair<id_ref, simple_id<Field*>> id_;
 };
 template<class StructureSignal, class Field>
 std::enable_if_t<
@@ -3941,7 +4606,7 @@ operator->*(
 
 // ALIA_FIELD(x, f) is equivalent to x->*T::f where T is the value type of x.
 #define ALIA_FIELD(x, f) ((x)->*&std::decay<decltype(read_signal(x))>::type::f)
-#ifdef ALIA_LOWERCASE_MACROS
+#ifndef ALIA_STRICT_MACROS
 #define alia_field(x, f) ALIA_FIELD(x, f)
 #endif
 
@@ -4012,7 +4677,8 @@ struct subscript_result_type<
 };
 
 // has_at_indexer<Container, Index>::value yields a compile-time boolean
-// indicating whether or not Container has an 'at' method that takes an Index.
+// indicating whether or not Container has an 'at' member function that takes an
+// Index.
 template<class Container, class Index, class = void_t<>>
 struct has_at_indexer : std::false_type
 {
@@ -4049,7 +4715,7 @@ invoke_const_subscript(
 }
 
 // const_subscript_returns_reference<Container,Index>::value yields a
-// compile-time boolean indicating where or not invoke_const_subscript returns
+// compile-time boolean indicating whether or not invoke_const_subscript returns
 // by reference (vs by value).
 template<class Container, class Index>
 struct const_subscript_returns_reference
@@ -4096,7 +4762,7 @@ struct const_subscript_invoker<
 };
 
 template<class ContainerSignal, class IndexSignal, class Value>
-std::enable_if_t<signal_can_write<ContainerSignal>::value>
+std::enable_if_t<signal_is_writable<ContainerSignal>::value>
 write_subscript(
     ContainerSignal const& container,
     IndexSignal const& index,
@@ -4108,21 +4774,19 @@ write_subscript(
 }
 
 template<class ContainerSignal, class IndexSignal, class Value>
-std::enable_if_t<!signal_can_write<ContainerSignal>::value>
-write_subscript(
-    ContainerSignal const& container,
-    IndexSignal const& index,
-    Value const& value)
+std::enable_if_t<!signal_is_writable<ContainerSignal>::value>
+write_subscript(ContainerSignal const&, IndexSignal const&, Value const&)
 {
 }
 
 template<class ContainerSignal, class IndexSignal>
-struct subscript_signal : signal<
+struct subscript_signal : preferred_id_signal<
                               subscript_signal<ContainerSignal, IndexSignal>,
                               typename subscript_result_type<
                                   typename ContainerSignal::value_type,
                                   typename IndexSignal::value_type>::type,
-                              typename ContainerSignal::direction_tag>
+                              typename ContainerSignal::direction_tag,
+                              id_pair<alia::id_ref, alia::id_ref>>
 {
     subscript_signal()
     {
@@ -4132,26 +4796,25 @@ struct subscript_signal : signal<
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return container_.is_readable() && index_.is_readable();
+        return container_.has_value() && index_.has_value();
     }
     typename subscript_signal::value_type const&
     read() const
     {
         return invoker_(container_.read(), index_.read());
     }
-    id_interface const&
-    value_id() const
+    auto
+    complex_value_id() const
     {
-        id_ = combine_ids(ref(container_.value_id()), ref(index_.value_id()));
-        return id_;
+        return combine_ids(ref(container_.value_id()), ref(index_.value_id()));
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return container_.is_readable() && index_.is_readable()
-               && container_.is_writable();
+        return container_.has_value() && index_.has_value()
+               && container_.ready_to_write();
     }
     void
     write(typename subscript_signal::value_type const& x) const
@@ -4162,7 +4825,6 @@ struct subscript_signal : signal<
  private:
     ContainerSignal container_;
     IndexSignal index_;
-    mutable id_pair<alia::id_ref, alia::id_ref> id_;
     const_subscript_invoker<
         typename ContainerSignal::value_type,
         typename IndexSignal::value_type>
@@ -4170,18 +4832,17 @@ struct subscript_signal : signal<
 };
 template<class ContainerSignal, class IndexSignal>
 subscript_signal<ContainerSignal, IndexSignal>
-make_subscript_signal(
-    ContainerSignal const& container, IndexSignal const& index)
+make_subscript_signal(ContainerSignal container, IndexSignal index)
 {
     return subscript_signal<ContainerSignal, IndexSignal>(container, index);
 }
 
 template<class Derived, class Value, class Direction>
 template<class Index>
-auto signal_base<Derived, Value, Direction>::
-operator[](Index const& index) const
+auto signal_base<Derived, Value, Direction>::operator[](Index index) const
 {
-    return make_subscript_signal(static_cast<Derived const&>(*this), index);
+    return make_subscript_signal(
+        static_cast<Derived const&>(*this), signalize(index));
 }
 
 } // namespace alia
@@ -4216,8 +4877,13 @@ template<class... Args>
 struct action_interface : untyped_action_interface
 {
     // Perform this action.
+    //
+    // :intermediary is used to implement the latch-like semantics of actions.
+    // It should be invoked AFTER reading any signals you need to read but
+    // BEFORE invoking any side effects.
+    //
     virtual void
-    perform(Args... args) const = 0;
+    perform(std::function<void()> const& intermediary, Args... args) const = 0;
 };
 
 // is_action_type<T>::value yields a compile-time boolean indicating whether or
@@ -4241,7 +4907,7 @@ void
 perform_action(action_interface<Args...> const& action, Args... args)
 {
     assert(action.is_ready());
-    action.perform(args...);
+    action.perform([]() {}, args...);
 }
 
 // action_ref is a reference to an action that implements the action interface
@@ -4266,9 +4932,9 @@ struct action_ref : action_interface<Args...>
     }
 
     void
-    perform(Args... args) const
+    perform(std::function<void()> const& intermediary, Args... args) const
     {
-        action_->perform(args...);
+        action_->perform(intermediary, args...);
     }
 
  private:
@@ -4283,13 +4949,13 @@ using action = action_ref<Args...>;
 // Using the comma operator between two actions creates a combined action that
 // performs the two actions in sequence.
 
-template<class First, class Second, class... Args>
-struct action_pair : First::action_interface
-{
-    action_pair()
-    {
-    }
+template<class First, class Second, class Interface>
+struct action_pair;
 
+template<class First, class Second, class... Args>
+struct action_pair<First, Second, action_interface<Args...>>
+    : action_interface<Args...>
+{
     action_pair(First const& first, Second const& second)
         : first_(first), second_(second)
     {
@@ -4302,10 +4968,10 @@ struct action_pair : First::action_interface
     }
 
     void
-    perform(Args... args) const
+    perform(std::function<void()> const& intermediary, Args... args) const
     {
-        first_.perform(args...);
-        second_.perform(args...);
+        second_.perform(
+            [&]() { first_.perform(intermediary, args...); }, args...);
     }
 
  private:
@@ -4322,34 +4988,90 @@ template<
 auto
 operator,(First const& first, Second const& second)
 {
-    return action_pair<First, Second>(first, second);
+    return action_pair<First, Second, typename First::action_interface>(
+        first, second);
 }
 
-// operator <<=
-//
-// sink <<= source, where :sink and :source are both signals, creates an action
-// that will set the value of :sink to the value held in :source. In order for
-// the action to be considered ready, :source must be readable and :sink must be
-// writable.
-
-template<class Sink, class Source>
-struct copy_action : action_interface<>
+// (a <<= s), where a is an action and s is a readable signal, returns another
+// action that is like :a but with the value of :s bound to its first argument.
+template<class Action, class Signal, class Interface>
+struct bound_action;
+template<class Action, class Signal, class BoundArg, class... Args>
+struct bound_action<Action, Signal, action_interface<BoundArg, Args...>>
+    : action_interface<Args...>
 {
-    copy_action(Sink const& sink, Source const& source)
-        : sink_(sink), source_(source)
+    bound_action(Action const& action, Signal const& signal)
+        : action_(action), signal_(signal)
     {
     }
 
     bool
     is_ready() const
     {
-        return source_.is_readable() && sink_.is_writable();
+        return action_.is_ready() && signal_.has_value();
     }
 
     void
-    perform() const
+    perform(std::function<void()> const& intermediary, Args... args) const
     {
-        sink_.write(source_.read());
+        action_.perform(intermediary, signal_.read(), args...);
+    }
+
+ private:
+    Action action_;
+    Signal signal_;
+};
+template<
+    class Action,
+    class Signal,
+    std::enable_if_t<
+        is_action_type<Action>::value && is_readable_signal_type<Signal>::value,
+        int> = 0>
+auto
+operator<<=(Action const& action, Signal const& signal)
+{
+    return bound_action<Action, Signal, typename Action::action_interface>(
+        action, signal);
+}
+
+template<
+    class Action,
+    class Value,
+    std::enable_if_t<
+        is_action_type<Action>::value && !is_signal_type<Value>::value,
+        int> = 0>
+auto
+operator<<=(Action const& action, Value const& v)
+{
+    return action <<= value(v);
+}
+
+// operator <<=
+//
+// sink <<= source, where :sink and :source are both signals, creates an
+// action that will set the value of :sink to the value held in :source. In
+// order for the action to be considered ready, :source must have a value and
+// :sink must be ready to write.
+
+template<class Sink, class Source>
+struct copy_action : action_interface<>
+{
+    copy_action(Sink sink, Source source) : sink_(sink), source_(source)
+    {
+    }
+
+    bool
+    is_ready() const
+    {
+        return source_.has_value() && sink_.ready_to_write();
+    }
+
+    void
+    perform(std::function<void()> const& intermediary) const
+    {
+        auto value = source_.read();
+        intermediary();
+        sink_.write(value);
     }
 
  private:
@@ -4365,12 +5087,10 @@ template<
             && is_readable_signal_type<Source>::value,
         int> = 0>
 auto
-operator<<=(Sink const& sink, Source const& source)
+operator<<=(Sink sink, Source source)
 {
     return copy_action<Sink, Source>(sink, source);
 }
-
-#ifndef ALIA_STRICT_OPERATORS
 
 template<
     class Sink,
@@ -4379,15 +5099,13 @@ template<
         is_writable_signal_type<Sink>::value && !is_signal_type<Source>::value,
         int> = 0>
 auto
-operator<<=(Sink const& sink, Source const& source)
+operator<<=(Sink sink, Source source)
 {
-    return sink <<= val(source);
+    return sink <<= value(source);
 }
 
-#endif
-
-// For most compound assignment operators (e.g., +=), a += b, where :a and :b
-// are signals, creates an action that sets :a equal to :a + :b.
+// For most compound assignment operators (e.g., +=), a += b, where :a and
+// :b are signals, creates an action that sets :a equal to :a + :b.
 
 #define ALIA_DEFINE_COMPOUND_ASSIGNMENT_OPERATOR(assignment_form, normal_form) \
     template<                                                                  \
@@ -4413,8 +5131,6 @@ ALIA_DEFINE_COMPOUND_ASSIGNMENT_OPERATOR(|=, |)
 
 #undef ALIA_DEFINE_COMPOUND_ASSIGNMENT_OPERATOR
 
-#ifndef ALIA_STRICT_OPERATORS
-
 #define ALIA_DEFINE_LIBERAL_COMPOUND_ASSIGNMENT_OPERATOR(                      \
     assignment_form, normal_form)                                              \
     template<                                                                  \
@@ -4426,7 +5142,7 @@ ALIA_DEFINE_COMPOUND_ASSIGNMENT_OPERATOR(|=, |)
             int> = 0>                                                          \
     auto operator assignment_form(A const& a, B const& b)                      \
     {                                                                          \
-        return a <<= (a normal_form val(b));                                 \
+        return a <<= (a normal_form value(b));                                 \
     }
 
 ALIA_DEFINE_LIBERAL_COMPOUND_ASSIGNMENT_OPERATOR(+=, +)
@@ -4438,8 +5154,6 @@ ALIA_DEFINE_LIBERAL_COMPOUND_ASSIGNMENT_OPERATOR(%=, %)
 ALIA_DEFINE_LIBERAL_COMPOUND_ASSIGNMENT_OPERATOR(&=, &)
 ALIA_DEFINE_LIBERAL_COMPOUND_ASSIGNMENT_OPERATOR(|=, |)
 
-#endif
-
 // The increment and decrement operators work similarly.
 
 #define ALIA_DEFINE_BY_ONE_OPERATOR(assignment_form, normal_form)              \
@@ -4448,14 +5162,14 @@ ALIA_DEFINE_LIBERAL_COMPOUND_ASSIGNMENT_OPERATOR(|=, |)
         std::enable_if_t<is_bidirectional_signal_type<A>::value, int> = 0>     \
     auto operator assignment_form(A const& a)                                  \
     {                                                                          \
-        return a <<= (a normal_form val(typename A::value_type(1)));         \
+        return a <<= (a normal_form value(typename A::value_type(1)));         \
     }                                                                          \
     template<                                                                  \
         class A,                                                               \
         std::enable_if_t<is_bidirectional_signal_type<A>::value, int> = 0>     \
     auto operator assignment_form(A const& a, int)                             \
     {                                                                          \
-        return a <<= (a normal_form val(typename A::value_type(1)));         \
+        return a <<= (a normal_form value(typename A::value_type(1)));         \
     }
 
 ALIA_DEFINE_BY_ONE_OPERATOR(++, +)
@@ -4463,65 +5177,64 @@ ALIA_DEFINE_BY_ONE_OPERATOR(--, -)
 
 #undef ALIA_DEFINE_BY_ONE_OPERATOR
 
-// make_toggle_action(flag), where :flag is a signal to a boolean, creates an
-// action that will toggle the value of :flag between true and false.
+// toggle(flag), where :flag is a signal to a boolean, creates an action
+// that will toggle the value of :flag between true and false.
 //
 // Note that this could also be used with other value types as long as the !
 // operator provides a reasonable "toggle" function.
 //
 template<class Flag>
 auto
-make_toggle_action(Flag const& flag)
+toggle(Flag flag)
 {
     return flag <<= !flag;
 }
 
-// make_push_back_action(collection, item), where both :collection and :item are
-// signals, creates an action that will push the value of :item onto the back
-// of :collection.
+// push_back(container), where :container is a signal, creates an action that
+// takes an item as a parameter and pushes it onto the back of :container.
 
-template<class Collection, class Item>
-struct push_back_action : action_interface<>
+template<class Container, class Item>
+struct push_back_action : action_interface<Item>
 {
-    push_back_action(Collection const& collection, Item const& item)
-        : collection_(collection), item_(item)
+    push_back_action(Container container) : container_(container)
     {
     }
 
     bool
     is_ready() const
     {
-        return collection_.is_readable() && collection_.is_writable()
-               && item_.is_readable();
+        return container_.has_value() && container_.ready_to_write();
     }
 
     void
-    perform() const
+    perform(std::function<void()> const& intermediary, Item item) const
     {
-        auto new_collection = collection_.read();
-        new_collection.push_back(item_.read());
-        collection_.write(new_collection);
+        auto new_container = container_.read();
+        new_container.push_back(item);
+        intermediary();
+        container_.write(new_container);
     }
 
  private:
-    Collection collection_;
-    Item item_;
+    Container container_;
 };
 
-template<class Collection, class Item>
+template<class Container>
 auto
-make_push_back_action(Collection const& collection, Item const& item)
+push_back(Container container)
 {
-    return push_back_action<Collection, Item>(collection, item);
+    return push_back_action<
+        Container,
+        typename Container::value_type::value_type>(container);
 }
 
-// lambda_action(is_ready, perform) creates an action whose behavior is defined
-// by two function objects.
+// lambda_action(is_ready, perform) creates an action whose behavior is
+// defined by two function objects.
 //
-// :is_ready takes no parameters and simply returns true or false to show if the
-// action is ready to be performed.
+// :is_ready takes no parameters and simply returns true or false to
+// indicate if the action is ready to be performed.
 //
-// :perform can take any number/type of arguments and this defines the signature
+// :perform can take any number/type of arguments and defines the signature
 // of the action.
 
 template<class Function>
@@ -4560,8 +5273,9 @@ struct lambda_action_object<IsReady, Perform, action_interface<Args...>>
     }
 
     void
-    perform(Args... args) const
+    perform(std::function<void()> const& intermediary, Args... args) const
     {
+        intermediary();
         perform_(args...);
     }
 
@@ -4580,365 +5294,17 @@ lambda_action(IsReady is_ready, Perform perform)
         typename lambda_action_signature<Perform>::type>(is_ready, perform);
 }
 
-// This is just a clear and concise way of indicating that a lambda action is
-// always ready.
-inline bool
-always_ready()
-{
-    return true;
-}
-
-// parameterized_action(f, args...) is used to construct actions that require
-// parameters that are represented as signals. :args should all be signals. The
-// action won't be considered ready until all signals are readable. f() is the
-// function that performs the action. Its arguments are the values read from the
-// argument signals.
-template<class Function, class... Args>
+// The single-argument version of lambda_action creates an action that's always
+// ready to perform.
+template<class Perform>
 auto
-parameterized_action(Function f, Args... args)
+lambda_action(Perform perform)
 {
-    return lambda_action(
-        [=]() { return signals_all_readable(args...); },
-        [=]() { return f(read_signal(args)...); });
+    return lambda_action([]() { return true; }, perform);
 }
 
 } // namespace alia
 
-
-
-
-namespace alia {
-
-// fake_readability(s), where :s is a signal, yields a wrapper for :s that
-// pretends to have read capabilities. It will never actually be readable, but
-// it will type-check as a readable signal.
-template<class Wrapped>
-struct readability_faker : signal<
-                               readability_faker<Wrapped>,
-                               typename Wrapped::value_type,
-                               typename signal_direction_union<
-                                   read_only_signal,
-                                   typename Wrapped::direction_tag>::type>
-{
-    readability_faker(Wrapped wrapped) : wrapped_(wrapped)
-    {
-    }
-    id_interface const&
-    value_id() const
-    {
-        return no_id;
-    }
-    bool
-    is_readable() const
-    {
-        return false;
-    }
-    // Since this is only faking readability, read() should never be called.
-    // LCOV_EXCL_START
-    typename Wrapped::value_type const&
-    read() const
-    {
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wnull-dereference"
-#endif
-        return *(typename Wrapped::value_type const*) nullptr;
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
-    }
-    // LCOV_EXCL_STOP
-    bool
-    is_writable() const
-    {
-        return wrapped_.is_writable();
-    }
-    void
-    write(typename Wrapped::value_type const& value) const
-    {
-        return wrapped_.write(value);
-    }
-
- private:
-    Wrapped wrapped_;
-};
-template<class Wrapped>
-readability_faker<Wrapped>
-fake_readability(Wrapped const& wrapped)
-{
-    return readability_faker<Wrapped>(wrapped);
-}
-
-// fake_writability(s), where :s is a signal, yields a wrapper for :s that
-// pretends to have write capabilities. It will never actually be writable, but
-// it will type-check as a writable signal.
-template<class Wrapped>
-struct writability_faker : signal<
-                               writability_faker<Wrapped>,
-                               typename Wrapped::value_type,
-                               typename signal_direction_union<
-                                   write_only_signal,
-                                   typename Wrapped::direction_tag>::type>
-{
-    writability_faker(Wrapped wrapped) : wrapped_(wrapped)
-    {
-    }
-    id_interface const&
-    value_id() const
-    {
-        return wrapped_.value_id();
-    }
-    bool
-    is_readable() const
-    {
-        return wrapped_.is_readable();
-    }
-    typename Wrapped::value_type const&
-    read() const
-    {
-        return wrapped_.read();
-    }
-    bool
-    is_writable() const
-    {
-        return false;
-    }
-    // Since this is only faking writability, write() should never be called.
-    // LCOV_EXCL_START
-    void
-    write(typename Wrapped::value_type const& value) const
-    {
-    }
-    // LCOV_EXCL_STOP
-
- private:
-    Wrapped wrapped_;
-};
-template<class Wrapped>
-writability_faker<Wrapped>
-fake_writability(Wrapped const& wrapped)
-{
-    return writability_faker<Wrapped>(wrapped);
-}
-
-// signal_cast<Value>(x), where :x is a signal, yields a proxy for :x with
-// the value type :Value. The proxy will apply static_casts to convert its
-// own values to and from :x's value type.
-template<class Wrapped, class To>
-struct signal_caster : regular_signal<
-                           signal_caster<Wrapped, To>,
-                           To,
-                           typename Wrapped::direction_tag>
-{
-    signal_caster(Wrapped wrapped) : wrapped_(wrapped)
-    {
-    }
-    bool
-    is_readable() const
-    {
-        return wrapped_.is_readable();
-    }
-    To const&
-    read() const
-    {
-        return lazy_reader_.read(
-            [&] { return static_cast<To>(wrapped_.read()); });
-    }
-    bool
-    is_writable() const
-    {
-        return wrapped_.is_writable();
-    }
-    void
-    write(To const& value) const
-    {
-        return wrapped_.write(static_cast<typename Wrapped::value_type>(value));
-    }
-
- private:
-    Wrapped wrapped_;
-    lazy_reader<To> lazy_reader_;
-};
-template<class To, class Wrapped>
-signal_caster<Wrapped, To>
-signal_cast(Wrapped const& wrapped)
-{
-    return signal_caster<Wrapped, To>(wrapped);
-}
-
-// is_readable(x) yields a signal to a boolean which indicates whether or
-// not x is readable. (The returned signal is always readable itself.)
-template<class Wrapped>
-struct readability_signal
-    : regular_signal<readability_signal<Wrapped>, bool, read_only_signal>
-{
-    readability_signal(Wrapped const& wrapped) : wrapped_(wrapped)
-    {
-    }
-    bool
-    is_readable() const
-    {
-        return true;
-    }
-    bool const&
-    read() const
-    {
-        value_ = wrapped_.is_readable();
-        return value_;
-    }
-
- private:
-    Wrapped wrapped_;
-    mutable bool value_;
-};
-template<class Wrapped>
-auto
-is_readable(Wrapped const& wrapped)
-{
-    return readability_signal<Wrapped>(wrapped);
-}
-
-// is_writable(x) yields a signal to a boolean which indicates whether or
-// not x is writable. (The returned signal is always readable.)
-template<class Wrapped>
-struct writability_signal
-    : regular_signal<writability_signal<Wrapped>, bool, read_only_signal>
-{
-    writability_signal(Wrapped const& wrapped) : wrapped_(wrapped)
-    {
-    }
-    bool
-    is_readable() const
-    {
-        return true;
-    }
-    bool const&
-    read() const
-    {
-        value_ = wrapped_.is_writable();
-        return value_;
-    }
-
- private:
-    Wrapped wrapped_;
-    mutable bool value_;
-};
-template<class Wrapped>
-auto
-is_writable(Wrapped const& wrapped)
-{
-    return writability_signal<Wrapped>(wrapped);
-}
-
-// add_fallback(primary, fallback), where :primary and :fallback are both
-// signals, yields another signal whose value is that of :primary if it's
-// readable and that of :fallback otherwise.
-// All writes go directly to :primary.
-template<class Primary, class Fallback>
-struct fallback_signal : signal<
-                             fallback_signal<Primary, Fallback>,
-                             typename Primary::value_type,
-                             typename Primary::direction_tag>
-{
-    fallback_signal()
-    {
-    }
-    fallback_signal(Primary primary, Fallback fallback)
-        : primary_(primary), fallback_(fallback)
-    {
-    }
-    bool
-    is_readable() const
-    {
-        return primary_.is_readable() || fallback_.is_readable();
-    }
-    typename Primary::value_type const&
-    read() const
-    {
-        return primary_.is_readable() ? primary_.read() : fallback_.read();
-    }
-    id_interface const&
-    value_id() const
-    {
-        id_ = combine_ids(
-            make_id(primary_.is_readable()),
-            primary_.is_readable() ? ref(primary_.value_id())
-                                   : ref(fallback_.value_id()));
-        return id_;
-    }
-    bool
-    is_writable() const
-    {
-        return primary_.is_writable();
-    }
-    void
-    write(typename Primary::value_type const& value) const
-    {
-        primary_.write(value);
-    }
-
- private:
-    mutable id_pair<simple_id<bool>, id_ref> id_;
-    Primary primary_;
-    Fallback fallback_;
-};
-template<class Primary, class Fallback>
-fallback_signal<Primary, Fallback>
-add_fallback(Primary const& primary, Fallback const& fallback)
-{
-    return fallback_signal<Primary, Fallback>(primary, fallback);
-}
-
-// simplify_id(s), where :s is a signal, yields a wrapper for :s with the exact
-// same read/write behavior but whose value ID is a simple_id (i.e., it is
-// simply the value of the signal).
-//
-// The main utility of this is in cases where you have a signal carrying a
-// small value with a complicated value ID (because it was picked from the
-// signal of a larger data structure, for example). The more complicated ID
-// might change superfluously.
-//
-template<class Wrapped>
-struct simplified_id_wrapper : regular_signal<
-                                   simplified_id_wrapper<Wrapped>,
-                                   typename Wrapped::value_type,
-                                   typename Wrapped::direction_tag>
-{
-    simplified_id_wrapper(Wrapped wrapped) : wrapped_(wrapped)
-    {
-    }
-    bool
-    is_readable() const
-    {
-        return wrapped_.is_readable();
-    }
-    typename Wrapped::value_type const&
-    read() const
-    {
-        return wrapped_.read();
-    }
-    bool
-    is_writable() const
-    {
-        return wrapped_.is_writable();
-    }
-    void
-    write(typename Wrapped::value_type const& value) const
-    {
-        return wrapped_.write(value);
-    }
-
- private:
-    Wrapped wrapped_;
-};
-template<class Wrapped>
-simplified_id_wrapper<Wrapped>
-simplify_id(Wrapped const& wrapped)
-{
-    return simplified_id_wrapper<Wrapped>(wrapped);
-}
-
-} // namespace alia
 
 
 namespace alia {
@@ -4975,9 +5341,9 @@ struct is_vector_like<
 
 template<class Item>
 auto
-get_alia_id(Item const& item)
+get_alia_id(Item const&)
 {
-    return no_id;
+    return null_id;
 }
 
 // for_each for map-like containers
@@ -4989,9 +5355,9 @@ template<
         is_map_like<typename ContainerSignal::value_type>::value,
         int> = 0>
 void
-for_each(Context ctx, ContainerSignal const& container_signal, Fn const& fn)
+for_each(Context ctx, ContainerSignal const& container_signal, Fn&& fn)
 {
-    ALIA_IF(is_readable(container_signal))
+    ALIA_IF(has_value(container_signal))
     {
         naming_context nc(ctx);
         auto const& container = read_signal(container_signal);
@@ -4999,7 +5365,7 @@ for_each(Context ctx, ContainerSignal const& container_signal, Fn const& fn)
         {
             named_block nb;
             auto iteration_id = get_alia_id(item.first);
-            if (iteration_id != no_id)
+            if (iteration_id != null_id)
                 nb.begin(nc, iteration_id);
             else
                 nb.begin(nc, make_id(&item));
@@ -5021,9 +5387,9 @@ template<
             && is_vector_like<typename ContainerSignal::value_type>::value,
         int> = 0>
 void
-for_each(Context ctx, ContainerSignal const& container_signal, Fn const& fn)
+for_each(Context ctx, ContainerSignal const& container_signal, Fn&& fn)
 {
-    ALIA_IF(is_readable(container_signal))
+    ALIA_IF(has_value(container_signal))
     {
         naming_context nc(ctx);
         auto const& container = read_signal(container_signal);
@@ -5032,11 +5398,11 @@ for_each(Context ctx, ContainerSignal const& container_signal, Fn const& fn)
         {
             named_block nb;
             auto iteration_id = get_alia_id(container[index]);
-            if (iteration_id != no_id)
+            if (iteration_id != null_id)
                 nb.begin(nc, iteration_id);
             else
                 nb.begin(nc, make_id(index));
-            fn(ctx, container_signal[val(index)]);
+            fn(ctx, container_signal[value(index)]);
         }
     }
     ALIA_END
@@ -5060,9 +5426,9 @@ struct list_item_signal : signal<
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return list_signal_.is_readable();
+        return list_signal_.has_value();
     }
     Item const&
     read() const
@@ -5070,9 +5436,9 @@ struct list_item_signal : signal<
         return *item_;
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return list_signal_.is_writable();
+        return list_signal_.ready_to_write();
     }
     void
     write(Item const& value) const
@@ -5104,9 +5470,9 @@ template<
             && !is_vector_like<typename ContainerSignal::value_type>::value,
         int> = 0>
 void
-for_each(Context ctx, ContainerSignal const& container_signal, Fn const& fn)
+for_each(Context ctx, ContainerSignal const& container_signal, Fn&& fn)
 {
-    ALIA_IF(is_readable(container_signal))
+    ALIA_IF(has_value(container_signal))
     {
         naming_context nc(ctx);
         auto const& container = read_signal(container_signal);
@@ -5115,7 +5481,7 @@ for_each(Context ctx, ContainerSignal const& container_signal, Fn const& fn)
         {
             named_block nb;
             auto iteration_id = get_alia_id(item);
-            if (iteration_id != no_id)
+            if (iteration_id != null_id)
                 nb.begin(nc, iteration_id);
             else
                 nb.begin(nc, make_id(&item));
@@ -5174,6 +5540,163 @@ eval_curve_at_x(
 } // namespace alia
 
 
+
+namespace alia {
+
+enum class async_status
+{
+    UNREADY,
+    LAUNCHED,
+    COMPLETE,
+    FAILED
+};
+
+template<class Value>
+struct async_operation_data : node_identity
+{
+    counter_type version = 0;
+    Value result;
+    async_status status = async_status::UNREADY;
+};
+
+template<class Value>
+void
+reset(async_operation_data<Value>& data)
+{
+    if (data.status != async_status::UNREADY)
+    {
+        ++data.version;
+        data.status = async_status::UNREADY;
+    }
+}
+
+template<class Value>
+struct async_signal : signal<async_signal<Value>, Value, read_only_signal>
+{
+    async_signal(async_operation_data<Value>& data) : data_(&data)
+    {
+    }
+    id_interface const&
+    value_id() const
+    {
+        id_ = make_id(data_->version);
+        return id_;
+    }
+    bool
+    has_value() const
+    {
+        return data_->status == async_status::COMPLETE;
+    }
+    Value const&
+    read() const
+    {
+        return data_->result;
+    }
+
+ private:
+    async_operation_data<Value>* data_;
+    mutable simple_id<counter_type> id_;
+};
+
+template<class Value>
+async_signal<Value>
+make_async_signal(async_operation_data<Value>& data)
+{
+    return async_signal<Value>(data);
+}
+
+template<class Result>
+void
+process_async_args(context, async_operation_data<Result>&, bool&)
+{
+}
+template<class Result, class Arg, class... Rest>
+void
+process_async_args(
+    context ctx,
+    async_operation_data<Result>& data,
+    bool& args_ready,
+    Arg const& arg,
+    Rest const&... rest)
+{
+    captured_id* cached_id;
+    get_cached_data(ctx, &cached_id);
+    if (is_refresh_event(ctx))
+    {
+        if (!signal_has_value(arg))
+        {
+            reset(data);
+            args_ready = false;
+        }
+        else if (!cached_id->matches(arg.value_id()))
+        {
+            reset(data);
+            cached_id->capture(arg.value_id());
+        }
+    }
+    process_async_args(ctx, data, args_ready, rest...);
+}
+
+template<class Result>
+struct async_result_event : targeted_event
+{
+    Result result;
+    unsigned version;
+};
+
+template<class Result, class Context, class Launcher, class... Args>
+auto
+async(Context ctx, Launcher launcher, Args const&... args)
+{
+    async_operation_data<Result>* data_ptr;
+    get_cached_data(ctx, &data_ptr);
+    auto& data = *data_ptr;
+
+    auto node_id = make_routable_node_id(ctx, data_ptr);
+
+    bool args_ready = true;
+    process_async_args(ctx, data, args_ready, args...);
+
+    ALIA_UNTRACKED_IF(
+        is_refresh_event(ctx) && data.status == async_status::UNREADY
+        && args_ready)
+    {
+        auto* system = &get_component<system_tag>(ctx);
+        auto version = data.version;
+        auto report_result = [=](Result result) {
+            async_result_event<Result> event;
+            event.result = std::move(result);
+            event.version = version;
+            dispatch_targeted_event(*system, event, node_id);
+            refresh_system(*system);
+        };
+
+        try
+        {
+            launcher(ctx, report_result, read_signal(args)...);
+        }
+        catch (...)
+        {
+            data.status = async_status::FAILED;
+        }
+    }
+    ALIA_END
+
+    handle_targeted_event<async_result_event<Result>>(
+        ctx, data_ptr, [&](auto ctx, auto& e) {
+            if (e.version == data.version)
+            {
+                data.result = std::move(e.result);
+                data.status = async_status::COMPLETE;
+            }
+        });
+
+    return make_async_signal(data);
+}
+
+} // namespace alia
+
+
 #include <utility>
 #include <vector>
 
@@ -5187,12 +5710,11 @@ namespace alia {
 // signal).
 //
 // The return value of transform() is a signal carrying a vector with the mapped
-// items. This signal is readable when all items are successfully transformed
-// (i.e., when the mapping function is returning a readable signal for every
-// item).
+// items. This signal has a value when all items are successfully transformed
+// (i.e., when the signals returned by the mapping function all have values).
 //
 // Note that this follows proper dataflow semantics in that the mapped values
-// are allowed to change over time. Even after the result is readable (and all
+// are allowed to change over time. Even after the result has a value (and all
 // items are successfully transformed), the mapping function will continue to be
 // invoked whenever necessary to allow events to be delivered and changes to
 // propogate.
@@ -5214,8 +5736,8 @@ struct mapped_sequence_signal : signal<
                                     read_only_signal>
 {
     mapped_sequence_signal(
-        mapped_sequence_data<MappedItem>& data, bool all_items_readable)
-        : data_(&data), all_items_readable_(all_items_readable)
+        mapped_sequence_data<MappedItem>& data, bool all_items_have_values)
+        : data_(&data), all_items_have_values_(all_items_have_values)
     {
     }
     id_interface const&
@@ -5225,9 +5747,9 @@ struct mapped_sequence_signal : signal<
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return all_items_readable_;
+        return all_items_have_values_;
     }
     std::vector<MappedItem> const&
     read() const
@@ -5237,7 +5759,7 @@ struct mapped_sequence_signal : signal<
 
  private:
     mapped_sequence_data<MappedItem>* data_;
-    bool all_items_readable_;
+    bool all_items_have_values_;
     mutable simple_id<counter_type> id_;
 };
 
@@ -5253,9 +5775,9 @@ transform(Context ctx, Container const& container, Function const& f)
     mapped_sequence_data<mapped_value_type>* data;
     get_cached_data(ctx, &data);
 
-    bool all_items_readable = false;
+    bool all_items_have_values = false;
 
-    ALIA_IF(is_readable(container))
+    ALIA_IF(has_value(container))
     {
         size_t container_size = read_signal(container).size();
 
@@ -5267,12 +5789,12 @@ transform(Context ctx, Container const& container, Function const& f)
             data->input_id.capture(container.value_id());
         }
 
-        size_t readable_item_count = 0;
+        size_t valid_item_count = 0;
         auto captured_item = data->mapped_items.begin();
         auto captured_id = data->item_ids.begin();
         for_each(ctx, container, [&](context ctx, auto item) {
             auto mapped_item = f(ctx, item);
-            if (signal_is_readable(mapped_item))
+            if (signal_has_value(mapped_item))
             {
                 if (!captured_id->matches(mapped_item.value_id()))
                 {
@@ -5280,7 +5802,7 @@ transform(Context ctx, Container const& container, Function const& f)
                     captured_id->capture(mapped_item.value_id());
                     ++data->output_version;
                 }
-                ++readable_item_count;
+                ++valid_item_count;
             }
             ++captured_item;
             ++captured_id;
@@ -5288,11 +5810,12 @@ transform(Context ctx, Container const& container, Function const& f)
         assert(captured_item == data->mapped_items.end());
         assert(captured_id == data->item_ids.end());
 
-        all_items_readable = (readable_item_count == container_size);
+        all_items_have_values = (valid_item_count == container_size);
     }
     ALIA_END
 
-    return mapped_sequence_signal<mapped_value_type>(*data, all_items_readable);
+    return mapped_sequence_signal<mapped_value_type>(
+        *data, all_items_have_values);
 }
 
 } // namespace alia
@@ -5304,22 +5827,22 @@ transform(Context ctx, Container const& container, Function const& f)
 
 namespace alia {
 
-// lambda_reader(is_readable, read) creates a read-only signal whose value is
-// determined by calling :is_readable and :read.
-template<class Value, class IsReadable, class Read>
-struct lambda_reader_signal : regular_signal<
-                                  lambda_reader_signal<Value, IsReadable, Read>,
-                                  Value,
-                                  read_only_signal>
+// lambda_reader(read) creates a read-only signal whose value is determined by
+// calling :read.
+template<class Value, class Read>
+struct simple_lambda_reader_signal
+    : regular_signal<
+          simple_lambda_reader_signal<Value, Read>,
+          Value,
+          read_only_signal>
 {
-    lambda_reader_signal(IsReadable is_readable, Read read)
-        : is_readable_(is_readable), read_(read)
+    simple_lambda_reader_signal(Read read) : read_(read)
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return is_readable_();
+        return true;
     }
     Value const&
     read() const
@@ -5329,33 +5852,67 @@ struct lambda_reader_signal : regular_signal<
     }
 
  private:
-    IsReadable is_readable_;
     Read read_;
     mutable decltype(read_()) value_;
 };
-template<class IsReadable, class Read>
+template<class Read>
 auto
-lambda_reader(IsReadable is_readable, Read read)
+lambda_reader(Read read)
 {
-    return lambda_reader_signal<
-        std::decay_t<decltype(read())>,
-        IsReadable,
-        Read>(is_readable, read);
+    return simple_lambda_reader_signal<std::decay_t<decltype(read())>, Read>(
+        read);
 }
 
-// lambda_reader(is_readable, read, generate_id) creates a read-only signal
-// whose value is determined by calling :is_readable and :read and whose ID is
+// lambda_reader(has_value, read) creates a read-only signal whose value is
+// determined by calling :has_value and :read.
+template<class Value, class HasValue, class Read>
+struct lambda_reader_signal : regular_signal<
+                                  lambda_reader_signal<Value, HasValue, Read>,
+                                  Value,
+                                  read_only_signal>
+{
+    lambda_reader_signal(HasValue has_value, Read read)
+        : has_value_(has_value), read_(read)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return has_value_();
+    }
+    Value const&
+    read() const
+    {
+        value_ = read_();
+        return value_;
+    }
+
+ private:
+    HasValue has_value_;
+    Read read_;
+    mutable decltype(read_()) value_;
+};
+template<class HasValue, class Read>
+auto
+lambda_reader(HasValue has_value, Read read)
+{
+    return lambda_reader_signal<std::decay_t<decltype(read())>, HasValue, Read>(
+        has_value, read);
+}
+
+// lambda_reader(has_value, read, generate_id) creates a read-only signal
+// whose value is determined by calling :has_value and :read and whose ID is
 // determined by calling :generate_id.
-template<class Value, class IsReadable, class Read, class GenerateId>
+template<class Value, class HasValue, class Read, class GenerateId>
 struct lambda_reader_signal_with_id
     : signal<
-          lambda_reader_signal_with_id<Value, IsReadable, Read, GenerateId>,
+          lambda_reader_signal_with_id<Value, HasValue, Read, GenerateId>,
           Value,
           read_only_signal>
 {
     lambda_reader_signal_with_id(
-        IsReadable is_readable, Read read, GenerateId generate_id)
-        : is_readable_(is_readable), read_(read), generate_id_(generate_id)
+        HasValue has_value, Read read, GenerateId generate_id)
+        : has_value_(has_value), read_(read), generate_id_(generate_id)
     {
     }
     id_interface const&
@@ -5365,9 +5922,9 @@ struct lambda_reader_signal_with_id
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return is_readable_();
+        return has_value_();
     }
     Value const&
     read() const
@@ -5377,54 +5934,54 @@ struct lambda_reader_signal_with_id
     }
 
  private:
-    IsReadable is_readable_;
+    HasValue has_value_;
     Read read_;
     mutable decltype(read_()) value_;
     GenerateId generate_id_;
     mutable decltype(generate_id_()) id_;
 };
-template<class IsReadable, class Read, class GenerateId>
+template<class HasValue, class Read, class GenerateId>
 auto
-lambda_reader(IsReadable is_readable, Read read, GenerateId generate_id)
+lambda_reader(HasValue has_value, Read read, GenerateId generate_id)
 {
     return lambda_reader_signal_with_id<
         std::decay_t<decltype(read())>,
-        IsReadable,
+        HasValue,
         Read,
-        GenerateId>(is_readable, read, generate_id);
+        GenerateId>(has_value, read, generate_id);
 }
 
-// lambda_bidirectional(is_readable, read, is_writable, write) creates a
-// bidirectional signal whose value is read by calling :is_readable and :read
-// and written by calling :is_writable and :write.
+// lambda_bidirectional(has_value, read, ready_to_write, write) creates a
+// bidirectional signal whose value is read by calling :has_value and :read
+// and written by calling :ready_to_write and :write.
 template<
     class Value,
-    class IsReadable,
+    class HasValue,
     class Read,
-    class IsWritable,
+    class ReadyToWrite,
     class Write>
 struct lambda_bidirectional_signal : regular_signal<
                                          lambda_bidirectional_signal<
                                              Value,
-                                             IsReadable,
+                                             HasValue,
                                              Read,
-                                             IsWritable,
+                                             ReadyToWrite,
                                              Write>,
                                          Value,
                                          bidirectional_signal>
 {
     lambda_bidirectional_signal(
-        IsReadable is_readable, Read read, IsWritable is_writable, Write write)
-        : is_readable_(is_readable),
+        HasValue has_value, Read read, ReadyToWrite ready_to_write, Write write)
+        : has_value_(has_value),
           read_(read),
-          is_writable_(is_writable),
+          ready_to_write_(ready_to_write),
           write_(write)
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return is_readable_();
+        return has_value_();
     }
     Value const&
     read() const
@@ -5433,9 +5990,9 @@ struct lambda_bidirectional_signal : regular_signal<
         return value_;
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return is_writable_();
+        return ready_to_write_();
     }
     void
     write(Value const& value) const
@@ -5444,57 +6001,57 @@ struct lambda_bidirectional_signal : regular_signal<
     }
 
  private:
-    IsReadable is_readable_;
+    HasValue has_value_;
     Read read_;
     mutable decltype(read_()) value_;
-    IsWritable is_writable_;
+    ReadyToWrite ready_to_write_;
     Write write_;
 };
-template<class IsReadable, class Read, class IsWritable, class Write>
+template<class HasValue, class Read, class ReadyToWrite, class Write>
 auto
 lambda_bidirectional(
-    IsReadable is_readable, Read read, IsWritable is_writable, Write write)
+    HasValue has_value, Read read, ReadyToWrite ready_to_write, Write write)
 {
     return lambda_bidirectional_signal<
         std::decay_t<decltype(read())>,
-        IsReadable,
+        HasValue,
         Read,
-        IsWritable,
-        Write>(is_readable, read, is_writable, write);
+        ReadyToWrite,
+        Write>(has_value, read, ready_to_write, write);
 }
 
-// lambda_bidirectional(is_readable, read, is_writable, write, generate_id)
-// creates a bidirectional signal whose value is read by calling :is_readable
-// and :read and written by calling :is_writable and :write. Its ID is
+// lambda_bidirectional(has_value, read, ready_to_write, write, generate_id)
+// creates a bidirectional signal whose value is read by calling :has_value
+// and :read and written by calling :ready_to_write and :write. Its ID is
 // determined by calling :generate_id.
 template<
     class Value,
-    class IsReadable,
+    class HasValue,
     class Read,
-    class IsWritable,
+    class ReadyToWrite,
     class Write,
     class GenerateId>
 struct lambda_bidirectional_signal_with_id
     : signal<
           lambda_bidirectional_signal_with_id<
               Value,
-              IsReadable,
+              HasValue,
               Read,
-              IsWritable,
+              ReadyToWrite,
               Write,
               GenerateId>,
           Value,
           bidirectional_signal>
 {
     lambda_bidirectional_signal_with_id(
-        IsReadable is_readable,
+        HasValue has_value,
         Read read,
-        IsWritable is_writable,
+        ReadyToWrite ready_to_write,
         Write write,
         GenerateId generate_id)
-        : is_readable_(is_readable),
+        : has_value_(has_value),
           read_(read),
-          is_writable_(is_writable),
+          ready_to_write_(ready_to_write),
           write_(write),
           generate_id_(generate_id)
     {
@@ -5506,9 +6063,9 @@ struct lambda_bidirectional_signal_with_id
         return id_;
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return is_readable_();
+        return has_value_();
     }
     Value const&
     read() const
@@ -5517,9 +6074,9 @@ struct lambda_bidirectional_signal_with_id
         return value_;
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return is_writable_();
+        return ready_to_write_();
     }
     void
     write(Value const& value) const
@@ -5528,49 +6085,49 @@ struct lambda_bidirectional_signal_with_id
     }
 
  private:
-    IsReadable is_readable_;
+    HasValue has_value_;
     Read read_;
     mutable decltype(read_()) value_;
-    IsWritable is_writable_;
+    ReadyToWrite ready_to_write_;
     Write write_;
     GenerateId generate_id_;
     mutable decltype(generate_id_()) id_;
 };
 template<
-    class IsReadable,
+    class HasValue,
     class Read,
-    class IsWritable,
+    class ReadyToWrite,
     class Write,
     class GenerateId>
 auto
 lambda_bidirectional(
-    IsReadable is_readable,
+    HasValue has_value,
     Read read,
-    IsWritable is_writable,
+    ReadyToWrite ready_to_write,
     Write write,
     GenerateId generate_id)
 {
     return lambda_bidirectional_signal_with_id<
         std::decay_t<decltype(read())>,
-        IsReadable,
+        HasValue,
         Read,
-        IsWritable,
+        ReadyToWrite,
         Write,
-        GenerateId>(is_readable, read, is_writable, write, generate_id);
+        GenerateId>(has_value, read, ready_to_write, write, generate_id);
 }
 
-// This is just a clear and concise way of indicating that a lambda signal is
-// always readable.
+// This is just a clear and concise way of indicating that a lambda signal
+// always has a value.
 inline bool
-always_readable()
+always_has_value()
 {
     return true;
 }
 
 // This is just a clear and concise way of indicating that a lambda signal is
-// always writable.
+// always ready to write.
 inline bool
-always_writable()
+always_ready()
 {
     return true;
 }
@@ -5597,9 +6154,9 @@ struct scaled_signal : regular_signal<
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return n_.is_readable() && scale_factor_.is_readable();
+        return n_.has_value() && scale_factor_.has_value();
     }
     typename N::value_type const&
     read() const
@@ -5608,9 +6165,9 @@ struct scaled_signal : regular_signal<
             [&] { return n_.read() * scale_factor_.read(); });
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return n_.is_writable() && scale_factor_.is_readable();
+        return n_.ready_to_write() && scale_factor_.has_value();
     }
     void
     write(typename N::value_type const& value) const
@@ -5625,9 +6182,15 @@ struct scaled_signal : regular_signal<
 };
 template<class N, class Factor>
 scaled_signal<N, Factor>
-scale(N const& n, Factor const& scale_factor)
+make_scaled_signal(N n, Factor scale_factor)
 {
     return scaled_signal<N, Factor>(n, scale_factor);
+}
+template<class N, class Factor>
+auto
+scale(N n, Factor scale_factor)
+{
+    return make_scaled_signal(n, signalize(scale_factor));
 }
 
 // offset(n, offset) presents an offset view of :n.
@@ -5641,9 +6204,9 @@ struct offset_signal : regular_signal<
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return n_.is_readable() && offset_.is_readable();
+        return n_.has_value() && offset_.has_value();
     }
     typename N::value_type const&
     read() const
@@ -5651,9 +6214,9 @@ struct offset_signal : regular_signal<
         return lazy_reader_.read([&] { return n_.read() + offset_.read(); });
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return n_.is_writable() && offset_.is_readable();
+        return n_.ready_to_write() && offset_.has_value();
     }
     void
     write(typename N::value_type const& value) const
@@ -5668,9 +6231,15 @@ struct offset_signal : regular_signal<
 };
 template<class N, class Offset>
 offset_signal<N, Offset>
-offset(N const& n, Offset const& offset)
+make_offset_signal(N n, Offset offset)
 {
     return offset_signal<N, Offset>(n, offset);
+}
+template<class N, class Offset>
+auto
+offset(N n, Offset offset)
+{
+    return make_offset_signal(n, signalize(offset));
 }
 
 // round_signal_writes(n, step) yields a wrapper which rounds any writes to
@@ -5685,9 +6254,9 @@ struct rounding_signal_wrapper : regular_signal<
     {
     }
     bool
-    is_readable() const
+    has_value() const
     {
-        return n_.is_readable();
+        return n_.has_value();
     }
     typename N::value_type const&
     read() const
@@ -5695,9 +6264,9 @@ struct rounding_signal_wrapper : regular_signal<
         return n_.read();
     }
     bool
-    is_writable() const
+    ready_to_write() const
     {
-        return n_.is_writable() && step_.is_readable();
+        return n_.ready_to_write() && step_.has_value();
     }
     void
     write(typename N::value_type const& value) const
@@ -5712,9 +6281,15 @@ struct rounding_signal_wrapper : regular_signal<
 };
 template<class N, class Step>
 rounding_signal_wrapper<N, Step>
-round_signal_writes(N const& n, Step const& step)
+make_rounding_signal_wrapper(N n, Step step)
 {
     return rounding_signal_wrapper<N, Step>(n, step);
+}
+template<class N, class Step>
+auto
+round_signal_writes(N n, Step step)
+{
+    return make_rounding_signal_wrapper(n, signalize(step));
 }
 
 } // namespace alia
@@ -5797,7 +6372,7 @@ struct state_signal : signal<state_signal<Value>, Value, bidirectional_signal>
     }
 
     bool
-    is_readable() const
+    has_value() const
     {
         return state_->is_initialized();
     }
@@ -5816,7 +6391,7 @@ struct state_signal : signal<state_signal<Value>, Value, bidirectional_signal>
     }
 
     bool
-    is_writable() const
+    ready_to_write() const
     {
         return true;
     }
@@ -5841,17 +6416,19 @@ make_state_signal(state_holder<Value>& state)
 
 // get_state(ctx, initial_value) returns a signal carrying some persistent local
 // state whose initial value is determined by the :initial_value signal. The
-// returned signal will not be readable until :initial_value is readable (or
-// a value is explicitly written to the state signal).
+// returned signal will not have a value until :initial_value has one or one is
+// explicitly written to the state signal.
 template<class Context, class InitialValue>
 auto
 get_state(Context ctx, InitialValue const& initial_value)
 {
-    state_holder<typename InitialValue::value_type>* state;
+    auto initial_value_signal = signalize(initial_value);
+
+    state_holder<typename decltype(initial_value_signal)::value_type>* state;
     get_data(ctx, &state);
 
-    if (!state->is_initialized() && signal_is_readable(initial_value))
-        state->set(read_signal(initial_value));
+    if (!state->is_initialized() && signal_has_value(initial_value_signal))
+        state->set(read_signal(initial_value_signal));
 
     return make_state_signal(*state);
 }
@@ -5859,8 +6436,286 @@ get_state(Context ctx, InitialValue const& initial_value)
 } // namespace alia
 
 
+
+#include <cmath>
+
+// This file provides various signals and adaptors that work with time.
+
 namespace alia {
+
+struct animation_timer_state
+{
+    bool active = false;
+    millisecond_count end_tick;
+};
+
+struct raw_animation_timer
+{
+    raw_animation_timer(context ctx) : ctx_(ctx)
+    {
+        get_cached_data(ctx, &state_);
+        update();
+    }
+    raw_animation_timer(dataless_context ctx, animation_timer_state& state)
+        : ctx_(ctx), state_(&state)
+    {
+        update();
+    }
+    bool
+    is_active() const
+    {
+        return state_->active;
+    }
+    millisecond_count
+    ticks_left() const
+    {
+        return ticks_left_;
+    }
+    void
+    start(millisecond_count duration)
+    {
+        state_->active = true;
+        state_->end_tick = get_raw_animation_tick_count(ctx_) + duration;
+    }
+
+ private:
+    void
+    update()
+    {
+        if (state_->active)
+        {
+            ticks_left_ = get_raw_animation_ticks_left(ctx_, state_->end_tick);
+            if (ticks_left_ == 0)
+                state_->active = false;
+        }
+        else
+        {
+            ticks_left_ = 0;
+        }
+    }
+
+    dataless_context ctx_;
+    animation_timer_state* state_;
+    millisecond_count ticks_left_;
+};
+
+struct animation_timer
+{
+    animation_timer(context ctx) : raw_(ctx)
+    {
+    }
+    animation_timer(dataless_context ctx, animation_timer_state& state)
+        : raw_(ctx, state)
+    {
+    }
+    auto
+    is_active() const
+    {
+        return value(raw_.is_active());
+    }
+    auto
+    ticks_left() const
+    {
+        return value(raw_.ticks_left());
+    }
+    auto
+    start()
+    {
+        return lambda_action(
+            [&](millisecond_count duration) { raw_.start(duration); });
+    }
+
+ private:
+    raw_animation_timer raw_;
+};
+
+// The following are interpolation curves that can be used for animations.
+typedef unit_cubic_bezier animation_curve;
+animation_curve const default_curve = {0.25, 0.1, 0.25, 1};
+animation_curve const linear_curve = {0, 0, 1, 1};
+animation_curve const ease_in_curve = {0.42, 0, 1, 1};
+animation_curve const ease_out_curve = {0, 0, 0.58, 1};
+animation_curve const ease_in_out_curve = {0.42, 0, 0.58, 1};
+
+// animated_transition specifies an animated transition from one state to
+// another, defined by a duration and a curve to follow.
+struct animated_transition
+{
+    animation_curve curve;
+    millisecond_count duration;
+};
+animated_transition const default_transition = {default_curve, 400};
+
+// A value_smoother is used to create smoothly changing views of values that
+// actually change abruptly.
+template<class Value>
+struct value_smoother
+{
+    bool initialized = false, in_transition;
+    millisecond_count duration, transition_end;
+    Value old_value, new_value;
+};
+
+// value_smoother requires the ability to interpolate the values it works with.
+// If the value type supplies addition and multiplication by scalers, then it
+// can be interpolated using the default implementation below. Another option
+// is to simply implement a compatible interpolate function directly for the
+// value type.
+
+// interpolate(a, b, factor) yields a * (1 - factor) + b * factor
+template<class Value>
+std::enable_if_t<!std::is_integral<Value>::value, Value>
+interpolate(Value const& a, Value const& b, double factor)
+{
+    return a * (1 - factor) + b * factor;
 }
+// Overload it for floats to eliminate warnings about conversions.
+static inline float
+interpolate(float a, float b, double factor)
+{
+    return float(a * (1 - factor) + b * factor);
+}
+// Overload it for integers to add rounding (and eliminate warnings).
+template<class Integer>
+std::enable_if_t<std::is_integral<Integer>::value, Integer>
+interpolate(Integer a, Integer b, double factor)
+{
+    return Integer(std::round(a * (1 - factor) + b * factor));
+}
+
+// reset_smoothing(smoother, value) causes the smoother to transition abruptly
+// to the value specified.
+template<class Value>
+void
+reset_smoothing(value_smoother<Value>& smoother, Value const& value)
+{
+    smoother.in_transition = false;
+    smoother.new_value = value;
+    smoother.initialized = true;
+}
+
+// smooth_raw_value(ctx, smoother, x, transition) returns a smoothed view of x.
+template<class Value>
+Value
+smooth_raw_value(
+    dataless_context ctx,
+    value_smoother<Value>& smoother,
+    Value const& x,
+    animated_transition const& transition = default_transition)
+{
+    if (!smoother.initialized)
+        reset_smoothing(smoother, x);
+    Value current_value = smoother.new_value;
+    if (smoother.in_transition)
+    {
+        millisecond_count ticks_left
+            = get_raw_animation_ticks_left(ctx, smoother.transition_end);
+        if (ticks_left > 0)
+        {
+            double fraction = eval_curve_at_x(
+                transition.curve,
+                1. - double(ticks_left) / smoother.duration,
+                1. / smoother.duration);
+            current_value
+                = interpolate(smoother.old_value, smoother.new_value, fraction);
+        }
+        else
+            smoother.in_transition = false;
+    }
+    if (is_refresh_event(ctx) && x != smoother.new_value)
+    {
+        smoother.duration =
+            // If we're just going back to the old value, go back in the same
+            // amount of time it took to get here.
+            smoother.in_transition && x == smoother.old_value
+                ? (transition.duration
+                   - get_raw_animation_ticks_left(ctx, smoother.transition_end))
+                : transition.duration;
+        smoother.transition_end
+            = get_raw_animation_tick_count(ctx) + smoother.duration;
+        smoother.old_value = current_value;
+        smoother.new_value = x;
+        smoother.in_transition = true;
+    }
+    return current_value;
+}
+
+// smooth is analogous to smooth_raw_value, but it deals with signals
+// instead of raw values.
+
+template<class Wrapped>
+struct smoothed_signal : regular_signal<
+                             smoothed_signal<Wrapped>,
+                             typename Wrapped::value_type,
+                             read_only_signal>
+{
+    smoothed_signal(
+        Wrapped wrapped, typename Wrapped::value_type smoothed_value)
+        : wrapped_(wrapped), smoothed_value_(smoothed_value)
+    {
+    }
+    id_interface const&
+    value_id() const
+    {
+        if (wrapped_.has_value())
+        {
+            id_ = make_id(smoothed_value_);
+            return id_;
+        }
+        else
+            return null_id;
+    }
+    bool
+    has_value() const
+    {
+        return wrapped_.has_value();
+    }
+    typename Wrapped::value_type const&
+    read() const
+    {
+        return smoothed_value_;
+    }
+
+ private:
+    Wrapped wrapped_;
+    typename Wrapped::value_type smoothed_value_;
+    mutable simple_id<typename Wrapped::value_type> id_;
+};
+template<class Wrapped>
+smoothed_signal<Wrapped>
+make_smoothed_signal(
+    Wrapped wrapped, typename Wrapped::value_type smoothed_value)
+{
+    return smoothed_signal<Wrapped>(wrapped, smoothed_value);
+}
+
+template<class Value, class Signal>
+auto
+smooth(
+    dataless_context ctx,
+    value_smoother<Value>& smoother,
+    Signal x,
+    animated_transition const& transition = default_transition)
+{
+    Value output = Value();
+    if (signal_has_value(x))
+        output = smooth_raw_value(ctx, smoother, read_signal(x), transition);
+    return make_smoothed_signal(x, output);
+}
+
+template<class Signal>
+auto
+smooth(
+    context ctx,
+    Signal x,
+    animated_transition const& transition = default_transition)
+{
+    value_smoother<typename Signal::value_type>* data;
+    get_cached_data(ctx, &data);
+    return smooth(ctx, *data, x, transition);
+}
+
+} // namespace alia
 
 
 
@@ -5878,7 +6733,7 @@ make_printf_friendly(Value x)
     return x;
 }
 
-static inline char const*
+inline char const*
 make_printf_friendly(std::string const& x)
 {
     return x.c_str();
@@ -5909,18 +6764,163 @@ invoke_snprintf(std::string const& format, Args const&... args)
     return s;
 }
 
-template<class... Args>
+template<class Format, class... Args>
 auto
-printf(context ctx, readable<std::string> format, Args const&... args)
+printf(context ctx, Format format, Args... args)
 {
-    return apply(ctx, ALIA_LAMBDIFY(invoke_snprintf), format, args...);
+    return apply(
+        ctx,
+        ALIA_LAMBDIFY(invoke_snprintf),
+        signalize(format),
+        signalize(args)...);
 }
 
-template<class... Args>
-auto
-printf(context ctx, char const* format, Args const&... args)
+// All conversion of values to and from text goes through the functions
+// from_string and to_string. In order to use a particular value type with
+// the text-based widgets and utilities provided here, that type must
+// implement these functions.
+
+#define ALIA_DECLARE_STRING_CONVERSIONS(T)                                     \
+    void from_string(T* value, std::string const& s);                          \
+    std::string to_string(T value);
+
+// from_string(value, s) should parse the string s and store it in *value.
+// It should throw a validation_error if the string doesn't parse.
+
+// to_string(value) should simply return the string form of value.
+
+// Implementations of from_string and to_string are provided for the following
+// types.
+
+ALIA_DECLARE_STRING_CONVERSIONS(short int)
+ALIA_DECLARE_STRING_CONVERSIONS(unsigned short int)
+ALIA_DECLARE_STRING_CONVERSIONS(int)
+ALIA_DECLARE_STRING_CONVERSIONS(unsigned int)
+ALIA_DECLARE_STRING_CONVERSIONS(long int)
+ALIA_DECLARE_STRING_CONVERSIONS(unsigned long int)
+ALIA_DECLARE_STRING_CONVERSIONS(long long int)
+ALIA_DECLARE_STRING_CONVERSIONS(unsigned long long int)
+ALIA_DECLARE_STRING_CONVERSIONS(float)
+ALIA_DECLARE_STRING_CONVERSIONS(double)
+ALIA_DECLARE_STRING_CONVERSIONS(std::string)
+
+// as_text(ctx, x) creates a text-based interface to the accessor x.
+template<class Readable>
+void
+update_text_conversion(keyed_data<std::string>* data, Readable x)
 {
-    return apply(ctx, ALIA_LAMBDIFY(invoke_snprintf), val(format), args...);
+    if (signal_has_value(x))
+    {
+        refresh_keyed_data(*data, x.value_id());
+        if (!is_valid(*data))
+            set(*data, to_string(read_signal(x)));
+    }
+    else
+    {
+        invalidate(*data);
+    }
+}
+template<class Readable>
+keyed_data_signal<std::string>
+as_text(context ctx, Readable x)
+{
+    keyed_data<std::string>* data;
+    get_cached_data(ctx, &data);
+    update_text_conversion(data, x);
+    return keyed_data_signal<std::string>(data);
+}
+
+// as_bidirectional_text(ctx, x) is similar to as_text but it's bidirectional.
+template<class Value>
+struct bidirectional_text_data
+{
+    captured_id input_id;
+    Value input_value;
+    bool output_valid = false;
+    std::string output_text;
+    counter_type output_version = 1;
+};
+template<class Value, class Readable>
+void
+update_bidirectional_text(bidirectional_text_data<Value>* data, Readable x)
+{
+    if (signal_has_value(x))
+    {
+        auto const& input_id = x.value_id();
+        if (!data->input_id.matches(input_id))
+        {
+            if (!data->output_valid || read_signal(x) != data->input_value)
+            {
+                data->input_value = read_signal(x);
+                data->output_text = to_string(read_signal(x));
+                data->output_valid = true;
+                ++data->output_version;
+            }
+            data->input_id.capture(input_id);
+        }
+    }
+    else
+    {
+        data->output_valid = false;
+    }
+}
+template<class Wrapped>
+struct bidirectional_text_signal : signal<
+                                       bidirectional_text_signal<Wrapped>,
+                                       std::string,
+                                       typename Wrapped::direction_tag>
+{
+    bidirectional_text_signal(
+        Wrapped wrapped,
+        bidirectional_text_data<typename Wrapped::value_type>* data)
+        : wrapped_(wrapped), data_(data)
+    {
+    }
+    bool
+    has_value() const
+    {
+        return data_->output_valid;
+    }
+    std::string const&
+    read() const
+    {
+        return data_->output_text;
+    }
+    id_interface const&
+    value_id() const
+    {
+        id_ = make_id(data_->output_version);
+        return id_;
+    }
+    bool
+    ready_to_write() const
+    {
+        return wrapped_.ready_to_write();
+    }
+    void
+    write(std::string const& s) const
+    {
+        typename Wrapped::value_type value;
+        from_string(&value, s);
+        data_->input_value = value;
+        wrapped_.write(value);
+        data_->output_text = s;
+        ++data_->output_version;
+    }
+
+ private:
+    Wrapped wrapped_;
+    bidirectional_text_data<typename Wrapped::value_type>* data_;
+    mutable simple_id<counter_type> id_;
+};
+template<class Signal>
+bidirectional_text_signal<Signal>
+as_bidirectional_text(context ctx, Signal x)
+{
+    bidirectional_text_data<typename Signal::value_type>* data;
+    get_cached_data(ctx, &data);
+    update_bidirectional_text(data, x);
+    return bidirectional_text_signal<Signal>(x, data);
 }
 
 } // namespace alia
@@ -5997,14 +6997,15 @@ operator<(captured_id const& a, captured_id const& b)
 
 } // namespace alia
 
+
 namespace alia {
 
 context
 make_context(
     context_component_storage* storage,
-    system* sys,
-    event_traversal* event,
-    data_traversal* data)
+    system& sys,
+    event_traversal& event,
+    data_traversal& data)
 {
     return add_component<data_traversal_tag>(
         add_component<event_traversal_tag>(
@@ -6014,6 +7015,47 @@ make_context(
         data);
 }
 
+void
+request_animation_refresh(dataless_context ctx)
+{
+    // Invoke the virtual method on the external system interface.
+    // And also set a flag to indicate that a refresh is needed.
+    system& sys = get_component<system_tag>(ctx);
+    if (!sys.refresh_needed)
+    {
+        if (sys.external)
+            sys.external->request_animation_refresh();
+        sys.refresh_needed = true;
+    }
+}
+
+millisecond_count
+get_raw_animation_tick_count(dataless_context ctx)
+{
+    request_animation_refresh(ctx);
+    return get_component<system_tag>(ctx).tick_counter;
+}
+
+value_signal<millisecond_count>
+get_animation_tick_count(dataless_context ctx)
+{
+    return value(get_raw_animation_tick_count(ctx));
+}
+
+millisecond_count
+get_raw_animation_ticks_left(dataless_context ctx, millisecond_count end_time)
+{
+    int ticks_remaining
+        = int(end_time - get_component<system_tag>(ctx).tick_counter);
+    if (ticks_remaining > 0)
+    {
+        if (is_refresh_event(ctx))
+            request_animation_refresh(ctx);
+        return millisecond_count(ticks_remaining);
+    }
+    return 0;
+}
+
 } // namespace alia
 
 #include <chrono>
@@ -6021,9 +7063,33 @@ make_context(
 
 namespace alia {
 
+namespace {
+
+millisecond_count
+get_tick_count_now()
+{
+    static auto start = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<
+               std::chrono::duration<millisecond_count, std::milli>>(
+               now - start)
+        .count();
+}
+
+} // namespace
+
+void
+refresh_system_time(system& sys)
+{
+    if (sys.automatic_time_updates)
+        sys.tick_counter = get_tick_count_now();
+}
+
 void
 refresh_system(system& sys)
 {
+    sys.refresh_needed = false;
+
     refresh_event refresh;
     dispatch_event(sys, refresh);
 }
@@ -6525,13 +7591,13 @@ invoke_controller(system& sys, event_traversal& events)
     data.gc_enabled = data.cache_clearing_enabled = is_refresh;
 
     context_component_storage storage;
-    context ctx = make_context(&storage, &sys, &events, &data);
+    context ctx = make_context(&storage, sys, events, data);
 
     sys.controller(ctx);
 }
 
-void
-route_event(system& sys, event_traversal& traversal, routing_region* target)
+static void
+route_event_(system& sys, event_traversal& traversal, routing_region* target)
 {
     // In order to construct the path to the target, we start at the target and
     // follow the 'parent' pointers until we reach the root.
@@ -6543,12 +7609,30 @@ route_event(system& sys, event_traversal& traversal, routing_region* target)
         path_node.rest = traversal.path_to_target;
         path_node.node = target;
         traversal.path_to_target = &path_node;
-        route_event(sys, traversal, target->parent.get());
+        route_event_(sys, traversal, target->parent.get());
     }
     else
     {
         invoke_controller(sys, traversal);
     }
+}
+
+void
+route_event(system& sys, event_traversal& traversal, routing_region* target)
+{
+    refresh_system_time(sys);
+    try
+    {
+        route_event_(sys, traversal, target);
+    }
+    catch (traversal_aborted&)
+    {
+    }
+}
+
+void abort_traversal(dataless_context)
+{
+    throw traversal_aborted();
 }
 
 } // namespace alia
@@ -6557,16 +7641,14 @@ namespace alia {
 
 if_block::if_block(data_traversal& traversal, bool condition)
 {
-    data_block* block;
-    get_data(traversal, &block);
+    data_block& block = get_data<data_block>(traversal);
     if (condition)
     {
-        scoped_data_block_.begin(traversal, *block);
+        scoped_data_block_.begin(traversal, block);
     }
-    else
+    else if (traversal.cache_clearing_enabled)
     {
-        if (traversal.cache_clearing_enabled)
-            clear_cached_data(*block);
+        clear_cached_data(block);
     }
 }
 
@@ -6686,6 +7768,125 @@ eval_curve_at_x(unit_cubic_bezier const& curve, double x, double epsilon)
     auto coeff = compute_curve_coefficients(curve);
 
     return sample_curve_y(coeff, solve_for_t_at_x(coeff, x, epsilon));
+}
+
+} // namespace alia
+
+#include <sstream>
+
+namespace alia {
+
+template<class T>
+bool
+string_to_value(std::string const& str, T* value)
+{
+    std::istringstream s(str);
+    T x;
+    if (!(s >> x))
+        return false;
+    s >> std::ws;
+    if (s.eof())
+    {
+        *value = x;
+        return true;
+    }
+    return false;
+}
+
+template<class T>
+std::string
+value_to_string(T const& value)
+{
+    std::ostringstream s;
+    s << value;
+    return s.str();
+}
+
+template<class T>
+void
+float_from_string(T* value, std::string const& str)
+{
+    if (!string_to_value(str, value))
+        throw validation_error("This input expects a number.");
+}
+
+#define ALIA_FLOAT_CONVERSIONS(T)                                              \
+    void from_string(T* value, std::string const& str)                         \
+    {                                                                          \
+        float_from_string(value, str);                                         \
+    }                                                                          \
+    std::string to_string(T value)                                             \
+    {                                                                          \
+        return value_to_string(value);                                         \
+    }
+
+ALIA_FLOAT_CONVERSIONS(float)
+ALIA_FLOAT_CONVERSIONS(double)
+
+template<class T>
+void
+signed_integer_from_string(T* value, std::string const& str)
+{
+    long long n;
+    if (!string_to_value(str, &n))
+        throw validation_error("This input expects an integer.");
+    T x = T(n);
+    if (x != n)
+        throw validation_error("This integer is outside the supported range.");
+    *value = x;
+}
+
+template<class T>
+void
+unsigned_integer_from_string(T* value, std::string const& str)
+{
+    unsigned long long n;
+    if (!string_to_value(str, &n))
+        throw validation_error("This input expects an integer.");
+    T x = T(n);
+    if (x != n)
+        throw validation_error("This integer is outside the supported range.");
+    *value = x;
+}
+
+#define ALIA_SIGNED_INTEGER_CONVERSIONS(T)                                     \
+    void from_string(T* value, std::string const& str)                         \
+    {                                                                          \
+        signed_integer_from_string(value, str);                                \
+    }                                                                          \
+    std::string to_string(T value)                                             \
+    {                                                                          \
+        return value_to_string(value);                                         \
+    }
+
+#define ALIA_UNSIGNED_INTEGER_CONVERSIONS(T)                                   \
+    void from_string(T* value, std::string const& str)                         \
+    {                                                                          \
+        unsigned_integer_from_string(value, str);                              \
+    }                                                                          \
+    std::string to_string(T value)                                             \
+    {                                                                          \
+        return value_to_string(value);                                         \
+    }
+
+ALIA_SIGNED_INTEGER_CONVERSIONS(short int)
+ALIA_UNSIGNED_INTEGER_CONVERSIONS(unsigned short int)
+ALIA_SIGNED_INTEGER_CONVERSIONS(int)
+ALIA_UNSIGNED_INTEGER_CONVERSIONS(unsigned int)
+ALIA_SIGNED_INTEGER_CONVERSIONS(long int)
+ALIA_UNSIGNED_INTEGER_CONVERSIONS(unsigned long int)
+ALIA_SIGNED_INTEGER_CONVERSIONS(long long int)
+ALIA_UNSIGNED_INTEGER_CONVERSIONS(unsigned long long int)
+
+void
+from_string(std::string* value, std::string const& str)
+{
+    *value = str;
+}
+std::string
+to_string(std::string value)
+{
+    return value;
 }
 
 } // namespace alia

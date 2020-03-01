@@ -3,11 +3,11 @@
 #include <QGridLayout>
 #include <QLabel>
 #include <QLayout>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QTextEdit>
 #include <QWidget>
 
-#define ALIA_LOWERCASE_MACROS
 #define ALIA_IMPLEMENTATION
 #include "alia.hpp"
 
@@ -15,27 +15,12 @@ using namespace alia;
 
 using std::string;
 
-struct qt_layout_node;
 struct qt_layout_container;
-struct qt_context;
-
-struct qt_system
-{
-    data_graph data;
-
-    // the root of the application's UI tree
-    qt_layout_node* root;
-
-    // the top-level window and layout for the UI - The entire application's UI
-    // tree lives inside this.
-    QWidget* window;
-    QVBoxLayout* layout;
-};
 
 struct qt_layout_node
 {
     virtual void
-    update(qt_system* system, QWidget* parent, QLayout* layout)
+    update(alia::system* system, QWidget* parent, QLayout* layout)
         = 0;
 
     qt_layout_node* next;
@@ -54,43 +39,54 @@ struct qt_layout_container : qt_layout_node
     bool dirty;
 };
 
-struct qt_event
+struct qt_event : targeted_event
 {
-    // This is just a hack for now. A null pointer here means that this is a
-    // refresh event. A non-null pointer means that some event happened for that
-    // widget (and it should be obvious what).
-    QWidget* target;
 };
 
-struct qt_context
+struct qt_traversal
 {
-    alia::data_traversal* data;
-
-    qt_system* system;
-
-    qt_layout_container* active_container;
+    qt_layout_container* active_container = nullptr;
     // a pointer to the pointer that should store the next item that's added
-    qt_layout_node** next_ptr;
+    qt_layout_node** next_ptr = nullptr;
+};
+ALIA_DEFINE_COMPONENT_TYPE(qt_traversal_tag, qt_traversal&)
 
-    bool is_refresh_pass;
+typedef alia::add_component_type_t<alia::context, qt_traversal_tag> qt_context;
 
-    qt_event* event;
+typedef alia::remove_component_type_t<qt_context, data_traversal_tag>
+    dataless_qt_context;
+
+struct qt_system
+{
+    alia::system* system;
+
+    std::function<void(qt_context)> controller;
+
+    // the root of the application's UI tree
+    qt_layout_node* root;
+
+    // the top-level window and layout for the UI - The entire application's UI
+    // tree lives inside this.
+    QWidget* window;
+    QVBoxLayout* layout;
+
+    void
+    operator()(alia::context ctx);
+};
+
+struct click_event : targeted_event
+{
 };
 
 void
-issue_ui_event(qt_system& system, QWidget* target);
-void
-update_ui(qt_system& system);
-
-void
-record_layout_change(qt_context& traversal)
+record_layout_change(qt_traversal& traversal)
 {
     if (traversal.active_container)
         traversal.active_container->record_change();
 }
 
 void
-set_next_node(qt_context& traversal, qt_layout_node* node)
+set_next_node(qt_traversal& traversal, qt_layout_node* node)
 {
     if (*traversal.next_ptr != node)
     {
@@ -100,8 +96,9 @@ set_next_node(qt_context& traversal, qt_layout_node* node)
 }
 
 void
-add_layout_node(qt_context& traversal, qt_layout_node* node)
+add_layout_node(dataless_qt_context ctx, qt_layout_node* node)
 {
+    qt_traversal& traversal = get_component<qt_traversal_tag>(ctx);
     set_next_node(traversal, node);
     traversal.next_ptr = &node->next;
 }
@@ -124,41 +121,39 @@ qt_layout_container::record_change()
 
 struct scoped_layout_container : noncopyable
 {
-    scoped_layout_container() : traversal_(0)
+    scoped_layout_container()
     {
     }
-    scoped_layout_container(
-        qt_context& traversal, qt_layout_container* container)
+    scoped_layout_container(qt_context ctx, qt_layout_container* container)
     {
-        begin(traversal, container);
+        begin(ctx, container);
     }
     ~scoped_layout_container()
     {
         end();
     }
     void
-    begin(qt_context& traversal, qt_layout_container* container);
+    begin(qt_context ctx, qt_layout_container* container);
     void
     end();
 
  private:
-    qt_context* traversal_;
+    qt_traversal* traversal_ = 0;
 };
 
 void
-scoped_layout_container::begin(
-    qt_context& traversal, qt_layout_container* container)
+scoped_layout_container::begin(qt_context ctx, qt_layout_container* container)
 {
-    if (traversal.is_refresh_pass)
-    {
-        traversal_ = &traversal;
+    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
+        traversal_ = &get_component<qt_traversal_tag>(ctx);
+        qt_traversal& traversal = *traversal_;
 
         set_next_node(traversal, container);
         container->parent = traversal.active_container;
 
         traversal.next_ptr = &container->children;
         traversal.active_container = container;
-    }
+    });
 }
 void
 scoped_layout_container::end()
@@ -173,12 +168,6 @@ scoped_layout_container::end()
 
         traversal_ = 0;
     }
-}
-
-alia::data_traversal&
-get_data_traversal(qt_context& ctx)
-{
-    return *ctx.data;
 }
 
 template<class T>
@@ -197,7 +186,7 @@ refresh_property(cached_property<T>& cache, Signal property)
     refresh_keyed_data(cache.value, property.value_id());
     // TODO: Decide how to handle cases where the property has changed but isn't
     // immediately available (specifically w.r.t. the dirty flag).
-    if (!is_valid(cache.value) && signal_is_readable(property))
+    if (!is_valid(cache.value) && signal_has_value(property))
     {
         set(cache.value, read_signal(property));
         cache.dirty = true;
@@ -210,7 +199,7 @@ struct qt_label : qt_layout_node
     cached_property<string> text;
 
     void
-    update(qt_system* system, QWidget* parent, QLayout* layout)
+    update(alia::system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -229,24 +218,24 @@ struct qt_label : qt_layout_node
 };
 
 static void
-do_label(qt_context& ctx, readable<string> text)
+do_label(qt_context ctx, readable<string> text)
 {
     qt_label* label;
     get_cached_data(ctx, &label);
-    if (ctx.is_refresh_pass)
-    {
+    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
         refresh_property(label->text, text);
         add_layout_node(ctx, label);
-    }
+    });
 }
 
-struct qt_button : qt_layout_node
+struct qt_button : qt_layout_node, node_identity
 {
     std::shared_ptr<QPushButton> object;
+    routable_node_id node_id;
     cached_property<string> text;
 
     void
-    update(qt_system* system, QWidget* parent, QLayout* layout)
+    update(alia::system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -254,11 +243,12 @@ struct qt_button : qt_layout_node
             object.reset(new QPushButton(parent));
             if (parent->isVisible())
                 object->show();
-            auto target = object.get();
+            auto node_id = this->node_id;
             QObject::connect(
-                object.get(), &QPushButton::clicked, [system, target]() {
-                    issue_ui_event(*system, target);
-                    update_ui(*system);
+                object.get(), &QPushButton::clicked, [system, node_id]() {
+                    qt_event event;
+                    dispatch_targeted_event(*system, event, node_id);
+                    refresh_system(*system);
                 });
         }
         layout->addWidget(object.get());
@@ -271,30 +261,31 @@ struct qt_button : qt_layout_node
 };
 
 static void
-do_button(qt_context& ctx, readable<string> text, action<> on_click)
+do_button(qt_context ctx, readable<string> text, action<> on_click)
 {
     qt_button* button;
     get_cached_data(ctx, &button);
-    if (ctx.is_refresh_pass)
-    {
+    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
         refresh_property(button->text, text);
+        button->node_id = make_routable_node_id(ctx, button);
         add_layout_node(ctx, button);
-    }
-    if (button->object && ctx.event->target == button->object.get()
-        && action_is_ready(on_click))
-    {
-        perform_action(on_click);
-        // end_pass(ctx);
-    }
+    });
+    handle_targeted_event<qt_event>(ctx, button, [&](auto ctx, auto& e) {
+        if (action_is_ready(on_click))
+        {
+            perform_action(on_click);
+        }
+    });
 }
 
-struct qt_text_control : qt_layout_node
+struct qt_text_control : qt_layout_node, node_identity
 {
     std::shared_ptr<QTextEdit> object;
+    routable_node_id node_id;
     cached_property<string> text;
 
     void
-    update(qt_system* system, QWidget* parent, QLayout* layout)
+    update(alia::system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -302,11 +293,15 @@ struct qt_text_control : qt_layout_node
             object.reset(new QTextEdit(parent));
             if (parent->isVisible())
                 object->show();
-            auto target = object.get();
+            auto node_id = this->node_id;
             QObject::connect(
-                object.get(), &QTextEdit::textChanged, [system, target]() {
-                    issue_ui_event(*system, target);
-                    update_ui(*system);
+                object.get(), &QTextEdit::textChanged, [system, node_id]() {
+                    qt_event event;
+                    // QMessageBox Msgbox;
+                    // Msgbox.setText("Got here!");
+                    // Msgbox.exec();
+                    dispatch_targeted_event(*system, event, node_id);
+                    refresh_system(*system);
                 });
         }
         layout->addWidget(object.get());
@@ -320,74 +315,72 @@ struct qt_text_control : qt_layout_node
 };
 
 static void
-do_text_control(qt_context& ctx, bidirectional<string> text)
+do_text_control(qt_context ctx, bidirectional<string> text)
 {
     qt_text_control* widget;
     get_cached_data(ctx, &widget);
-    if (ctx.is_refresh_pass)
-    {
+    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
+        widget->node_id = make_routable_node_id(ctx, widget);
         refresh_property(widget->text, text);
         add_layout_node(ctx, widget);
-    }
-    if (widget->object && ctx.event->target == widget->object.get())
-    {
+    });
+    handle_targeted_event<qt_event>(ctx, widget, [&](auto ctx, auto& e) {
         write_signal(text, widget->object->toPlainText().toUtf8().constData());
-        // end_pass(ctx);
+    });
+}
+
+void
+qt_system::operator()(alia::context vanilla_ctx)
+{
+    qt_traversal traversal;
+    qt_context ctx = extend_context<qt_traversal_tag>(vanilla_ctx, traversal);
+
+    if (is_refresh_event(ctx))
+    {
+        traversal.next_ptr = &this->root;
+    }
+
+    this->controller(ctx);
+
+    if (is_refresh_event(ctx))
+    {
+        while (this->layout->takeAt(0))
+            ;
+        this->root->update(this->system, this->window, this->layout);
     }
 }
 
-qt_system the_system;
-
 void
-initialize_ui(qt_system& system)
+initialize(
+    qt_system& qt_system,
+    alia::system& alia_system,
+    std::function<void(qt_context)> controller)
 {
-    system.root = 0;
-    system.window = new QWidget;
-    system.layout = new QVBoxLayout(system.window);
-    system.window->setLayout(system.layout);
+    // Initialize the Qt system.
+    qt_system.system = &alia_system;
+    qt_system.root = 0;
+    qt_system.window = new QWidget;
+    qt_system.layout = new QVBoxLayout(qt_system.window);
+    qt_system.window->setLayout(qt_system.layout);
+
+    // Hook up the Qt system to the alia system.
+    // alia_system.external = &dom_system.external;
+    alia_system.controller = std::ref(qt_system);
+    qt_system.controller = std::move(controller);
+
+    // Do the initial refresh.
+    refresh_system(alia_system);
 }
 
 void
-do_app_ui(qt_context& ctx);
-
-void
-issue_ui_event(qt_system& system, QWidget* target)
-{
-    qt_context ctx;
-
-    bool is_refresh = target == 0;
-
-    ctx.system = &system;
-    ctx.active_container = 0;
-    ctx.next_ptr = &system.root;
-    ctx.is_refresh_pass = is_refresh;
-
-    qt_event event;
-    event.target = target;
-    ctx.event = &event;
-
-    data_traversal data;
-    scoped_data_traversal sdt(system.data, data);
-    ctx.data = &data;
-
-    // Only use refresh events to decide when data is no longer needed.
-    data.gc_enabled = data.cache_clearing_enabled = is_refresh;
-
-    do_app_ui(ctx);
-}
-
-void
-refresh_ui(qt_system& system)
-{
-    issue_ui_event(system, 0);
-}
+do_app_ui(qt_context ctx);
 
 struct qt_column : qt_layout_container
 {
     std::shared_ptr<QVBoxLayout> object;
 
     void
-    update(qt_system* system, QWidget* parent, QLayout* layout)
+    update(alia::system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
         {
@@ -409,7 +402,7 @@ struct column_layout : noncopyable
     column_layout()
     {
     }
-    column_layout(qt_context& ctx)
+    column_layout(qt_context ctx)
     {
         begin(ctx);
     }
@@ -418,7 +411,7 @@ struct column_layout : noncopyable
         end();
     }
     void
-    begin(qt_context& ctx)
+    begin(qt_context ctx)
     {
         qt_column* column;
         get_cached_data(ctx, &column);
@@ -434,49 +427,43 @@ struct column_layout : noncopyable
     scoped_layout_container slc_;
 };
 
-void
-update_ui(qt_system& system)
-{
-    refresh_ui(system);
-    while (system.layout->takeAt(0))
-        ;
-    system.root->update(&system, system.window, system.layout);
-}
+alia::system the_system;
+qt_system the_qt;
 
 int
 main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
 
-    initialize_ui(the_system);
+    initialize(the_qt, the_system, do_app_ui);
 
-    update_ui(the_system);
+    refresh_system(the_system);
 
-    the_system.window->setWindowTitle("alia Qt");
-    the_system.window->show();
+    the_qt.window->setWindowTitle("alia Qt");
+    the_qt.window->show();
 
     return app.exec();
 }
 
 void
-do_app_ui(qt_context& ctx)
+do_app_ui(qt_context ctx)
 {
     column_layout row(ctx);
 
-    do_label(ctx, val("Hello, world!"));
+    do_label(ctx, value("Hello, world!"));
 
-    auto x = get_state(ctx, val(string()));
+    auto x = get_state(ctx, string());
     do_text_control(ctx, x);
     do_text_control(ctx, x);
 
     do_label(ctx, x);
 
-    auto state = get_state(ctx, val(true));
+    auto state = get_state(ctx, true);
     alia_if(state)
     {
-        do_label(ctx, val("Secret message!"));
+        do_label(ctx, value("Secret message!"));
     }
     alia_end
 
-        do_button(ctx, val("Toggle!"), make_toggle_action(state));
+        do_button(ctx, value("Toggle!"), toggle(state));
 }
