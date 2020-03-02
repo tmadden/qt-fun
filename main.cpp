@@ -45,6 +45,7 @@ struct qt_event : targeted_event
 
 struct qt_traversal
 {
+    QWidget* active_parent = nullptr;
     qt_layout_container* active_container = nullptr;
     // a pointer to the pointer that should store the next item that's added
     qt_layout_node** next_ptr = nullptr;
@@ -230,47 +231,88 @@ do_label(qt_context ctx, readable<string> text)
 
 struct qt_button : qt_layout_node, node_identity
 {
-    std::shared_ptr<QPushButton> object;
-    routable_node_id node_id;
-    cached_property<string> text;
+    std::unique_ptr<QPushButton> object;
+    captured_id text_id;
+    routing_region_ptr route;
 
     void
     update(alia::system* system, QWidget* parent, QLayout* layout)
     {
-        if (!object)
-        {
-            // TODO: Allow changes in parent.
-            object.reset(new QPushButton(parent));
-            if (parent->isVisible())
-                object->show();
-            auto node_id = this->node_id;
-            QObject::connect(
-                object.get(), &QPushButton::clicked, [system, node_id]() {
-                    qt_event event;
-                    dispatch_targeted_event(*system, event, node_id);
-                    refresh_system(*system);
-                });
-        }
         layout->addWidget(object.get());
-        if (text.dirty)
-        {
-            object->setText(get(text.value).c_str());
-            text.dirty = false;
-        }
     }
 };
+
+template<class Signal, class OnNewValue, class OnLostValue>
+void
+refresh_signal_shadow(
+    captured_id& id,
+    Signal signal,
+    OnNewValue&& on_new_value,
+    OnLostValue&& on_lost_value)
+{
+    if (signal.has_value())
+    {
+        if (!id.matches(signal.value_id()))
+        {
+            on_new_value(signal.read());
+            id.capture(signal.value_id());
+        }
+    }
+    else
+    {
+        if (!id.matches(null_id))
+        {
+            on_lost_value();
+            id.capture(null_id);
+        }
+    }
+}
 
 static void
 do_button(qt_context ctx, readable<string> text, action<> on_click)
 {
-    qt_button* button;
-    get_cached_data(ctx, &button);
+    auto& button = get_cached_data<qt_button>(ctx);
+
     handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
-        refresh_property(button->text, text);
-        button->node_id = make_routable_node_id(ctx, button);
-        add_layout_node(ctx, button);
+        auto& system = get_component<system_tag>(ctx);
+
+        auto& traversal = get_component<qt_traversal_tag>(ctx);
+        auto* parent = traversal.active_parent;
+
+        button.route = get_active_routing_region(ctx);
+
+        if (!button.object)
+        {
+            button.object.reset(new QPushButton(parent));
+            if (parent->isVisible())
+                button.object->show();
+            QObject::connect(
+                button.object.get(),
+                &QPushButton::clicked,
+                // The Qt object is technically owned within both of these, so
+                // I'm pretty sure it's safe to reference both.
+                [&system, &button]() {
+                    qt_event event;
+                    dispatch_targeted_event(
+                        system, event, routable_node_id{&button, button.route});
+                    refresh_system(system);
+                });
+        }
+
+        // Theoretically, this could change.
+        if (button.object->parent() != parent)
+            button.object->setParent(parent);
+
+        add_layout_node(ctx, &button);
+
+        refresh_signal_shadow(
+            button.text_id,
+            text,
+            [&](auto text) { button.object->setText(text.c_str()); },
+            [&]() { button.object->setText(""); });
     });
-    handle_targeted_event<qt_event>(ctx, button, [&](auto ctx, auto& e) {
+
+    handle_targeted_event<qt_event>(ctx, &button, [&](auto ctx, auto& e) {
         if (action_is_ready(on_click))
         {
             perform_action(on_click);
@@ -297,9 +339,6 @@ struct qt_text_control : qt_layout_node, node_identity
             QObject::connect(
                 object.get(), &QTextEdit::textChanged, [system, node_id]() {
                     qt_event event;
-                    // QMessageBox Msgbox;
-                    // Msgbox.setText("Got here!");
-                    // Msgbox.exec();
                     dispatch_targeted_event(*system, event, node_id);
                     refresh_system(*system);
                 });
@@ -338,6 +377,7 @@ qt_system::operator()(alia::context vanilla_ctx)
     if (is_refresh_event(ctx))
     {
         traversal.next_ptr = &this->root;
+        traversal.active_parent = this->window;
     }
 
     this->controller(ctx);
@@ -388,11 +428,15 @@ struct qt_column : qt_layout_container
             object.reset(new QVBoxLayout(parent));
         }
         layout->addItem(object.get());
-        while (object->takeAt(0))
-            ;
-        for (auto* node = children; node; node = node->next)
+        if (this->dirty)
         {
-            node->update(system, parent, object.get());
+            while (object->takeAt(0))
+                ;
+            for (auto* node = children; node; node = node->next)
+            {
+                node->update(system, parent, object.get());
+            }
+            this->dirty = false;
         }
     }
 };
@@ -465,5 +509,6 @@ do_app_ui(qt_context ctx)
     }
     alia_end
 
-        do_button(ctx, value("Toggle!"), toggle(state));
+        do_button(ctx, x, toggle(state));
+    do_button(ctx, value("Toggle!"), toggle(state));
 }
