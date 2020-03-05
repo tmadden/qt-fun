@@ -1649,14 +1649,14 @@ signal_ready_to_write(Signal const& signal)
 
 // Write a signal's value.
 // Unlike calling signal.write() directly, this will generate a compile-time
-// error if the signal's type doesn't support writing and a run-time error if
-// the signal isn't currently ready to write.
+// error if the signal's type doesn't support writing.
+// Note that if the signal isn't ready to write, this is a no op.
 template<class Signal, class Value>
 std::enable_if_t<signal_is_writable<Signal>::value>
 write_signal(Signal const& signal, Value const& value)
 {
-    assert(signal.ready_to_write());
-    signal.write(value);
+    if (signal.ready_to_write())
+        signal.write(value);
 }
 
 // signal_is_bidirectional<Signal>::value yields a compile-time boolean
@@ -1827,6 +1827,34 @@ struct preferred_id_signal<
  private:
     mutable ComplexId id_;
 };
+
+// refresh_signal_shadow is useful to monitoring a signal and responding to
+// changes in its value.
+template<class Signal, class OnNewValue, class OnLostValue>
+void
+refresh_signal_shadow(
+    captured_id& id,
+    Signal signal,
+    OnNewValue&& on_new_value,
+    OnLostValue&& on_lost_value)
+{
+    if (signal.has_value())
+    {
+        if (!id.matches(signal.value_id()))
+        {
+            on_new_value(signal.read());
+            id.capture(signal.value_id());
+        }
+    }
+    else
+    {
+        if (!id.matches(null_id))
+        {
+            on_lost_value();
+            id.capture(null_id);
+        }
+    }
+}
 
 } // namespace alia
 
@@ -2041,6 +2069,9 @@ ALIA_DEFINE_COMPONENT_TYPE(event_traversal_tag, event_traversal&)
 struct system;
 ALIA_DEFINE_COMPONENT_TYPE(system_tag, system&)
 
+struct timing_component;
+ALIA_DEFINE_COMPONENT_TYPE(timing_tag, timing_component&)
+
 // the structure we use to store components - It provides direct storage of the
 // commonly-used components in the core of alia.
 
@@ -2050,6 +2081,7 @@ struct context_component_storage
     system* sys = nullptr;
     event_traversal* event = nullptr;
     data_traversal* data = nullptr;
+    timing_component* timing = nullptr;
 
     // generic storage for other components
     generic_component_storage<any_ref> generic;
@@ -2062,15 +2094,16 @@ ALIA_ADD_DIRECT_COMPONENT_ACCESS(
     context_component_storage, event_traversal_tag, event)
 ALIA_ADD_DIRECT_COMPONENT_ACCESS(
     context_component_storage, data_traversal_tag, data)
+ALIA_ADD_DIRECT_COMPONENT_ACCESS(context_component_storage, timing_tag, timing)
 
 // the typedefs for the context - There are two because we want to be able to
 // represent the context with and without data capabilities.
 
-typedef add_component_type_t<
-    add_component_type_t<
-        empty_component_collection<context_component_storage>,
-        system_tag>,
-    event_traversal_tag>
+typedef add_component_types_t<
+    empty_component_collection<context_component_storage>,
+    system_tag,
+    event_traversal_tag,
+    timing_tag>
     dataless_context;
 
 typedef add_component_type_t<dataless_context, data_traversal_tag> context;
@@ -2082,7 +2115,8 @@ make_context(
     context_component_storage* storage,
     system& sys,
     event_traversal& event,
-    data_traversal& data);
+    data_traversal& data,
+    timing_component& timing);
 
 template<class Context>
 Context
@@ -2126,12 +2160,24 @@ get_data_traversal(Context ctx)
     return get_component<data_traversal_tag>(ctx);
 }
 
-// And some functions for accessing the context/system timing capabilities...
+} // namespace alia
+
+
+#include <functional>
+
+
+
+namespace alia {
 
 // Currently, alia's only sense of time is that of a monotonically increasing
 // millisecond counter. It's understood to have an arbitrary start point and is
 // allowed to wrap around, so 'unsigned' is considered sufficient.
 typedef unsigned millisecond_count;
+
+struct timing_component
+{
+    millisecond_count tick_counter = 0;
+};
 
 // Request that the UI context refresh again quickly enough for smooth
 // animation.
@@ -2157,9 +2203,6 @@ millisecond_count
 get_raw_animation_ticks_left(dataless_context ctx, millisecond_count end_tick);
 
 } // namespace alia
-
-
-#include <functional>
 
 
 #include <cassert>
@@ -2891,6 +2934,9 @@ struct scoped_data_traversal
 
 namespace alia {
 
+millisecond_count
+get_default_tick_count();
+
 struct external_interface
 {
     // alia calls this every frame when an animation is in progress.
@@ -2898,41 +2944,32 @@ struct external_interface
     request_animation_refresh()
     {
     }
+
+    // Get the current value of the system's millisecond tick counter.
+    // The default implementation of this uses std::chrono::steady_clock.
+    virtual millisecond_count
+    get_tick_count() const
+    {
+        return get_default_tick_count();
+    }
 };
 
 struct system
 {
     data_graph data;
     std::function<void(context)> controller;
-    millisecond_count tick_counter = 0;
-    bool automatic_time_updates = true;
     bool refresh_needed = false;
     external_interface* external = nullptr;
 };
-
-void
-refresh_system(system& sys);
-
-void
-refresh_system_time(system& sys);
-
-inline void
-set_automatic_time_updates(system& sys, bool enabled)
-{
-    sys.automatic_time_updates = enabled;
-}
-
-inline void
-set_millisecond_tick_counter(system& sys, millisecond_count count)
-{
-    sys.tick_counter = count;
-}
 
 inline bool
 system_needs_refresh(system const& sys)
 {
     return sys.refresh_needed;
 }
+
+void
+refresh_system(system& sys);
 
 } // namespace alia
 
@@ -3801,6 +3838,8 @@ get_active_routing_region(Context ctx)
                                    : routing_region_ptr();
 }
 
+namespace impl {
+
 // Set up the event traversal so that it will route the control flow to the
 // given target. (And also invoke the traversal.)
 // :target can be null, in which case no (further) routing will be done.
@@ -3828,6 +3867,16 @@ dispatch_event(system& sys, Event& event)
     traversal.event_type = &typeid(Event);
     traversal.event = &event;
     route_event(sys, traversal, 0);
+}
+
+} // namespace impl
+
+template<class Event>
+void
+dispatch_event(system& sys, Event& event)
+{
+    impl::dispatch_event(sys, event);
+    refresh_system(sys);
 }
 
 struct traversal_aborted
@@ -3884,7 +3933,7 @@ detect_event(dataless_context ctx, Event** event)
 
 template<class Event, class Context, class Handler>
 void
-handle_event(Context ctx, Handler&& handler)
+on_event(Context ctx, Handler&& handler)
 {
     Event* e;
     ALIA_UNTRACKED_IF(detect_event(ctx, &e))
@@ -3942,7 +3991,8 @@ void
 dispatch_targeted_event(system& sys, Event& event, routable_node_id const& id)
 {
     event.target_id = id.id;
-    dispatch_targeted_event(sys, event, id.region);
+    impl::dispatch_targeted_event(sys, event, id.region);
+    refresh_system(sys);
 }
 
 template<class Event>
@@ -3954,7 +4004,7 @@ detect_targeted_event(dataless_context ctx, node_id id, Event** event)
 
 template<class Event, class Context, class Handler>
 void
-handle_targeted_event(Context ctx, node_id id, Handler&& handler)
+on_targeted_event(Context ctx, node_id id, Handler&& handler)
 {
     Event* e;
     ALIA_UNTRACKED_IF(detect_targeted_event(ctx, id, &e))
@@ -3976,6 +4026,17 @@ is_refresh_event(dataless_context ctx)
 {
     refresh_event* e;
     return detect_event(ctx, &e);
+}
+
+template<class Context, class Handler>
+void
+on_refresh(Context ctx, Handler handler)
+{
+    ALIA_UNTRACKED_IF(is_refresh_event(ctx))
+    {
+        handler(ctx);
+    }
+    ALIA_END
 }
 
 } // namespace alia
@@ -4906,8 +4967,8 @@ template<class... Args>
 void
 perform_action(action_interface<Args...> const& action, Args... args)
 {
-    assert(action.is_ready());
-    action.perform([]() {}, args...);
+    if (action.is_ready())
+        action.perform([]() {}, args...);
 }
 
 // action_ref is a reference to an action that implements the action interface
@@ -5552,7 +5613,7 @@ enum class async_status
 };
 
 template<class Value>
-struct async_operation_data : node_identity
+struct async_operation_data
 {
     counter_type version = 0;
     Value result;
@@ -5637,59 +5698,43 @@ process_async_args(
     process_async_args(ctx, data, args_ready, rest...);
 }
 
-template<class Result>
-struct async_result_event : targeted_event
-{
-    Result result;
-    unsigned version;
-};
-
 template<class Result, class Context, class Launcher, class... Args>
 auto
 async(Context ctx, Launcher launcher, Args const&... args)
 {
-    async_operation_data<Result>* data_ptr;
-    get_cached_data(ctx, &data_ptr);
+    std::shared_ptr<async_operation_data<Result>>& data_ptr
+        = get_cached_data<std::shared_ptr<async_operation_data<Result>>>(ctx);
+    if (!data_ptr)
+        data_ptr.reset(new async_operation_data<Result>);
     auto& data = *data_ptr;
-
-    auto node_id = make_routable_node_id(ctx, data_ptr);
 
     bool args_ready = true;
     process_async_args(ctx, data, args_ready, args...);
 
-    ALIA_UNTRACKED_IF(
-        is_refresh_event(ctx) && data.status == async_status::UNREADY
-        && args_ready)
-    {
-        auto* system = &get_component<system_tag>(ctx);
-        auto version = data.version;
-        auto report_result = [=](Result result) {
-            async_result_event<Result> event;
-            event.result = std::move(result);
-            event.version = version;
-            dispatch_targeted_event(*system, event, node_id);
-            refresh_system(*system);
-        };
-
-        try
+    on_refresh(ctx, [&](auto ctx) {
+        if (data.status == async_status::UNREADY && args_ready)
         {
-            launcher(ctx, report_result, read_signal(args)...);
-        }
-        catch (...)
-        {
-            data.status = async_status::FAILED;
-        }
-    }
-    ALIA_END
-
-    handle_targeted_event<async_result_event<Result>>(
-        ctx, data_ptr, [&](auto ctx, auto& e) {
-            if (e.version == data.version)
+            auto* system = &get_component<system_tag>(ctx);
+            auto version = data.version;
+            auto report_result = [system, version, data_ptr](Result result) {
+                auto& data = *data_ptr;
+                if (data.version == version)
+                {
+                    data.result = std::move(result);
+                    data.status = async_status::COMPLETE;
+                }
+                refresh_system(*system);
+            };
+            try
             {
-                data.result = std::move(e.result);
-                data.status = async_status::COMPLETE;
+                launcher(ctx, report_result, read_signal(args)...);
             }
-        });
+            catch (...)
+            {
+                data.status = async_status::FAILED;
+            }
+        }
+    });
 
     return make_async_signal(data);
 }
@@ -7005,15 +7050,50 @@ make_context(
     context_component_storage* storage,
     system& sys,
     event_traversal& event,
-    data_traversal& data)
+    data_traversal& data,
+    timing_component& timing)
 {
     return add_component<data_traversal_tag>(
-        add_component<event_traversal_tag>(
-            add_component<system_tag>(
-                make_empty_component_collection(storage), sys),
-            event),
+        add_component<timing_tag>(
+            add_component<event_traversal_tag>(
+                add_component<system_tag>(
+                    make_empty_component_collection(storage), sys),
+                event),
+            timing),
         data);
 }
+
+} // namespace alia
+
+#include <chrono>
+
+
+namespace alia {
+
+millisecond_count
+get_default_tick_count()
+{
+    static auto start = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<
+               std::chrono::duration<millisecond_count, std::milli>>(
+               now - start)
+        .count();
+}
+
+void
+refresh_system(system& sys)
+{
+    sys.refresh_needed = false;
+
+    refresh_event refresh;
+    impl::dispatch_event(sys, refresh);
+}
+
+} // namespace alia
+
+
+namespace alia {
 
 void
 request_animation_refresh(dataless_context ctx)
@@ -7033,7 +7113,7 @@ millisecond_count
 get_raw_animation_tick_count(dataless_context ctx)
 {
     request_animation_refresh(ctx);
-    return get_component<system_tag>(ctx).tick_counter;
+    return get_component<timing_tag>(ctx).tick_counter;
 }
 
 value_signal<millisecond_count>
@@ -7046,7 +7126,7 @@ millisecond_count
 get_raw_animation_ticks_left(dataless_context ctx, millisecond_count end_time)
 {
     int ticks_remaining
-        = int(end_time - get_component<system_tag>(ctx).tick_counter);
+        = int(end_time - get_component<timing_tag>(ctx).tick_counter);
     if (ticks_remaining > 0)
     {
         if (is_refresh_event(ctx))
@@ -7054,44 +7134,6 @@ get_raw_animation_ticks_left(dataless_context ctx, millisecond_count end_time)
         return millisecond_count(ticks_remaining);
     }
     return 0;
-}
-
-} // namespace alia
-
-#include <chrono>
-
-
-namespace alia {
-
-namespace {
-
-millisecond_count
-get_tick_count_now()
-{
-    static auto start = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    return std::chrono::duration_cast<
-               std::chrono::duration<millisecond_count, std::milli>>(
-               now - start)
-        .count();
-}
-
-} // namespace
-
-void
-refresh_system_time(system& sys)
-{
-    if (sys.automatic_time_updates)
-        sys.tick_counter = get_tick_count_now();
-}
-
-void
-refresh_system(system& sys)
-{
-    sys.refresh_needed = false;
-
-    refresh_event refresh;
-    dispatch_event(sys, refresh);
 }
 
 } // namespace alia
@@ -7531,6 +7573,7 @@ scoped_data_traversal::end()
 
 } // namespace alia
 
+
 namespace alia {
 
 void
@@ -7590,11 +7633,17 @@ invoke_controller(system& sys, event_traversal& events)
     // Only use refresh events to decide when data is no longer needed.
     data.gc_enabled = data.cache_clearing_enabled = is_refresh;
 
+    timing_component timing;
+    timing.tick_counter = sys.external ? sys.external->get_tick_count()
+                                       : get_default_tick_count();
+
     context_component_storage storage;
-    context ctx = make_context(&storage, sys, events, data);
+    context ctx = make_context(&storage, sys, events, data, timing);
 
     sys.controller(ctx);
 }
+
+namespace impl {
 
 static void
 route_event_(system& sys, event_traversal& traversal, routing_region* target)
@@ -7620,7 +7669,6 @@ route_event_(system& sys, event_traversal& traversal, routing_region* target)
 void
 route_event(system& sys, event_traversal& traversal, routing_region* target)
 {
-    refresh_system_time(sys);
     try
     {
         route_event_(sys, traversal, target);
@@ -7629,6 +7677,8 @@ route_event(system& sys, event_traversal& traversal, routing_region* target)
     {
     }
 }
+
+} // namespace impl
 
 void abort_traversal(dataless_context)
 {

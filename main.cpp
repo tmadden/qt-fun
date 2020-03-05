@@ -39,10 +39,6 @@ struct qt_layout_container : qt_layout_node
     bool dirty;
 };
 
-struct qt_event : targeted_event
-{
-};
-
 struct qt_traversal
 {
     QWidget* active_parent = nullptr;
@@ -73,10 +69,6 @@ struct qt_system
 
     void
     operator()(alia::context ctx);
-};
-
-struct click_event : targeted_event
-{
 };
 
 void
@@ -145,7 +137,7 @@ struct scoped_layout_container : noncopyable
 void
 scoped_layout_container::begin(qt_context ctx, qt_layout_container* container)
 {
-    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
+    on_refresh(ctx, [&](auto ctx) {
         traversal_ = &get_component<qt_traversal_tag>(ctx);
         qt_traversal& traversal = *traversal_;
 
@@ -171,63 +163,50 @@ scoped_layout_container::end()
     }
 }
 
-template<class T>
-struct cached_property
-{
-    // the value provided by the app
-    keyed_data<T> value;
-    // Does this need to be updated on the back end?
-    bool dirty;
-};
-
-template<class T, class Signal>
-void
-refresh_property(cached_property<T>& cache, Signal property)
-{
-    refresh_keyed_data(cache.value, property.value_id());
-    // TODO: Decide how to handle cases where the property has changed but isn't
-    // immediately available (specifically w.r.t. the dirty flag).
-    if (!is_valid(cache.value) && signal_has_value(property))
-    {
-        set(cache.value, read_signal(property));
-        cache.dirty = true;
-    }
-}
-
 struct qt_label : qt_layout_node
 {
     std::shared_ptr<QLabel> object;
-    cached_property<string> text;
+    captured_id text_id;
 
     void
     update(alia::system* system, QWidget* parent, QLayout* layout)
     {
-        if (!object)
-        {
-            // TODO: Allow changes in parent.
-            object.reset(new QLabel(parent));
-            if (parent->isVisible())
-                object->show();
-        }
+        if (object->parent() != parent)
+            object->setParent(parent);
         layout->addWidget(object.get());
-        if (text.dirty)
-        {
-            object->setText(get(text.value).c_str());
-            text.dirty = false;
-        }
     }
 };
 
 static void
 do_label(qt_context ctx, readable<string> text)
 {
-    qt_label* label;
-    get_cached_data(ctx, &label);
-    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
-        refresh_property(label->text, text);
-        add_layout_node(ctx, label);
+    auto& label = get_cached_data<qt_label>(ctx);
+
+    on_refresh(ctx, [&](auto ctx) {
+        auto& system = get_component<system_tag>(ctx);
+
+        if (!label.object)
+        {
+            auto& traversal = get_component<qt_traversal_tag>(ctx);
+            auto* parent = traversal.active_parent;
+            label.object.reset(new QLabel(parent));
+            if (parent->isVisible())
+                label.object->show();
+        }
+
+        add_layout_node(ctx, &label);
+
+        refresh_signal_shadow(
+            label.text_id,
+            text,
+            [&](auto text) { label.object->setText(text.c_str()); },
+            [&]() { label.object->setText(""); });
     });
 }
+
+struct click_event : targeted_event
+{
+};
 
 struct qt_button : qt_layout_node, node_identity
 {
@@ -238,51 +217,26 @@ struct qt_button : qt_layout_node, node_identity
     void
     update(alia::system* system, QWidget* parent, QLayout* layout)
     {
+        if (object->parent() != parent)
+            object->setParent(parent);
         layout->addWidget(object.get());
     }
 };
-
-template<class Signal, class OnNewValue, class OnLostValue>
-void
-refresh_signal_shadow(
-    captured_id& id,
-    Signal signal,
-    OnNewValue&& on_new_value,
-    OnLostValue&& on_lost_value)
-{
-    if (signal.has_value())
-    {
-        if (!id.matches(signal.value_id()))
-        {
-            on_new_value(signal.read());
-            id.capture(signal.value_id());
-        }
-    }
-    else
-    {
-        if (!id.matches(null_id))
-        {
-            on_lost_value();
-            id.capture(null_id);
-        }
-    }
-}
 
 static void
 do_button(qt_context ctx, readable<string> text, action<> on_click)
 {
     auto& button = get_cached_data<qt_button>(ctx);
 
-    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
+    on_refresh(ctx, [&](auto ctx) {
         auto& system = get_component<system_tag>(ctx);
-
-        auto& traversal = get_component<qt_traversal_tag>(ctx);
-        auto* parent = traversal.active_parent;
 
         button.route = get_active_routing_region(ctx);
 
         if (!button.object)
         {
+            auto& traversal = get_component<qt_traversal_tag>(ctx);
+            auto* parent = traversal.active_parent;
             button.object.reset(new QPushButton(parent));
             if (parent->isVisible())
                 button.object->show();
@@ -292,16 +246,11 @@ do_button(qt_context ctx, readable<string> text, action<> on_click)
                 // The Qt object is technically owned within both of these, so
                 // I'm pretty sure it's safe to reference both.
                 [&system, &button]() {
-                    qt_event event;
+                    click_event event;
                     dispatch_targeted_event(
                         system, event, routable_node_id{&button, button.route});
-                    refresh_system(system);
                 });
         }
-
-        // Theoretically, this could change.
-        if (button.object->parent() != parent)
-            button.object->setParent(parent);
 
         add_layout_node(ctx, &button);
 
@@ -312,7 +261,7 @@ do_button(qt_context ctx, readable<string> text, action<> on_click)
             [&]() { button.object->setText(""); });
     });
 
-    handle_targeted_event<qt_event>(ctx, &button, [&](auto ctx, auto& e) {
+    on_targeted_event<click_event>(ctx, &button, [&](auto ctx, auto& e) {
         if (action_is_ready(on_click))
         {
             perform_action(on_click);
@@ -320,100 +269,77 @@ do_button(qt_context ctx, readable<string> text, action<> on_click)
     });
 }
 
+struct value_update_event : targeted_event
+{
+    string value;
+};
+
 struct qt_text_control : qt_layout_node, node_identity
 {
     std::shared_ptr<QTextEdit> object;
-    routable_node_id node_id;
-    cached_property<string> text;
+    captured_id text_id;
+    routing_region_ptr route;
 
     void
     update(alia::system* system, QWidget* parent, QLayout* layout)
     {
-        if (!object)
-        {
-            // TODO: Allow changes in parent.
-            object.reset(new QTextEdit(parent));
-            if (parent->isVisible())
-                object->show();
-            auto node_id = this->node_id;
-            QObject::connect(
-                object.get(), &QTextEdit::textChanged, [system, node_id]() {
-                    qt_event event;
-                    dispatch_targeted_event(*system, event, node_id);
-                    refresh_system(*system);
-                });
-        }
+        if (object->parent() != parent)
+            object->setParent(parent);
         layout->addWidget(object.get());
-        if (text.dirty)
-        {
-            if (object->toPlainText().toUtf8().constData() != get(text.value))
-                object->setText(get(text.value).c_str());
-            text.dirty = false;
-        }
     }
 };
 
 static void
 do_text_control(qt_context ctx, bidirectional<string> text)
 {
-    qt_text_control* widget;
-    get_cached_data(ctx, &widget);
-    handle_event<refresh_event>(ctx, [&](auto ctx, auto& e) {
-        widget->node_id = make_routable_node_id(ctx, widget);
-        refresh_property(widget->text, text);
-        add_layout_node(ctx, widget);
+    auto& widget = get_cached_data<qt_text_control>(ctx);
+
+    on_refresh(ctx, [&](auto ctx) {
+        auto& system = get_component<system_tag>(ctx);
+
+        widget.route = get_active_routing_region(ctx);
+
+        if (!widget.object)
+        {
+            auto& traversal = get_component<qt_traversal_tag>(ctx);
+            auto* parent = traversal.active_parent;
+            widget.object.reset(new QTextEdit(parent));
+            if (parent->isVisible())
+                widget.object->show();
+            QObject::connect(
+                widget.object.get(),
+                &QTextEdit::textChanged,
+                // The Qt object is technically owned within both of these, so
+                // I'm pretty sure it's safe to reference both.
+                [&system, &widget]() {
+                    value_update_event event;
+                    event.value
+                        = widget.object->toPlainText().toUtf8().constData();
+                    dispatch_targeted_event(
+                        system, event, routable_node_id{&widget, widget.route});
+                });
+        }
+
+        add_layout_node(ctx, &widget);
+
+        refresh_signal_shadow(
+            widget.text_id,
+            text,
+            [&](auto text) {
+                // Prevent update cycles.
+                if (widget.object->toPlainText().toUtf8().constData() != text)
+                    widget.object->setText(text.c_str());
+            },
+            [&]() {
+                // Prevent update cycles.
+                if (widget.object->toPlainText().toUtf8().constData() != "")
+                    widget.object->setText("");
+            });
     });
-    handle_targeted_event<qt_event>(ctx, widget, [&](auto ctx, auto& e) {
-        write_signal(text, widget->object->toPlainText().toUtf8().constData());
-    });
+
+    on_targeted_event<value_update_event>(
+        ctx, &widget, [&](auto ctx, auto& e) { write_signal(text, e.value); });
 }
-
-void
-qt_system::operator()(alia::context vanilla_ctx)
-{
-    qt_traversal traversal;
-    qt_context ctx = extend_context<qt_traversal_tag>(vanilla_ctx, traversal);
-
-    if (is_refresh_event(ctx))
-    {
-        traversal.next_ptr = &this->root;
-        traversal.active_parent = this->window;
-    }
-
-    this->controller(ctx);
-
-    if (is_refresh_event(ctx))
-    {
-        while (this->layout->takeAt(0))
-            ;
-        this->root->update(this->system, this->window, this->layout);
-    }
-}
-
-void
-initialize(
-    qt_system& qt_system,
-    alia::system& alia_system,
-    std::function<void(qt_context)> controller)
-{
-    // Initialize the Qt system.
-    qt_system.system = &alia_system;
-    qt_system.root = 0;
-    qt_system.window = new QWidget;
-    qt_system.layout = new QVBoxLayout(qt_system.window);
-    qt_system.window->setLayout(qt_system.layout);
-
-    // Hook up the Qt system to the alia system.
-    // alia_system.external = &dom_system.external;
-    alia_system.controller = std::ref(qt_system);
-    qt_system.controller = std::move(controller);
-
-    // Do the initial refresh.
-    refresh_system(alia_system);
-}
-
-void
-do_app_ui(qt_context ctx);
 
 struct qt_column : qt_layout_container
 {
@@ -423,11 +349,13 @@ struct qt_column : qt_layout_container
     update(alia::system* system, QWidget* parent, QLayout* layout)
     {
         if (!object)
-        {
-            // TODO: Allow changes in parent.
             object.reset(new QVBoxLayout(parent));
-        }
+
+        if (object->parent() != parent)
+            object->setParent(parent);
+
         layout->addItem(object.get());
+
         if (this->dirty)
         {
             while (object->takeAt(0))
@@ -471,6 +399,50 @@ struct column_layout : noncopyable
     scoped_layout_container slc_;
 };
 
+void
+qt_system::operator()(alia::context vanilla_ctx)
+{
+    qt_traversal traversal;
+    qt_context ctx = extend_context<qt_traversal_tag>(vanilla_ctx, traversal);
+
+    on_refresh(ctx, [&](auto ctx) {
+        traversal.next_ptr = &this->root;
+        traversal.active_parent = this->window;
+    });
+
+    this->controller(ctx);
+
+    on_refresh(ctx, [&](auto ctx) {
+        while (this->layout->takeAt(0))
+            ;
+        this->root->update(this->system, this->window, this->layout);
+    });
+}
+
+void
+initialize(
+    qt_system& qt_system,
+    alia::system& alia_system,
+    std::function<void(qt_context)> controller)
+{
+    // Initialize the Qt system.
+    qt_system.system = &alia_system;
+    qt_system.root = 0;
+    qt_system.window = new QWidget;
+    qt_system.layout = new QVBoxLayout(qt_system.window);
+    qt_system.window->setLayout(qt_system.layout);
+
+    // Hook up the Qt system to the alia system.
+    alia_system.controller = std::ref(qt_system);
+    qt_system.controller = std::move(controller);
+
+    // Do the initial refresh.
+    refresh_system(alia_system);
+}
+
+void
+do_app_ui(qt_context ctx);
+
 alia::system the_system;
 qt_system the_qt;
 
@@ -494,7 +466,7 @@ do_app_ui(qt_context ctx)
 {
     column_layout row(ctx);
 
-    do_label(ctx, value("Hello, world!"));
+    do_label(ctx, value("Hello, World!"));
 
     auto x = get_state(ctx, string());
     do_text_control(ctx, x);
@@ -503,12 +475,12 @@ do_app_ui(qt_context ctx)
     do_label(ctx, x);
 
     auto state = get_state(ctx, true);
-    alia_if(state)
+    ALIA_IF(state)
     {
         do_label(ctx, value("Secret message!"));
     }
-    alia_end
+    ALIA_END
 
-        do_button(ctx, x, toggle(state));
+    do_button(ctx, x, toggle(state));
     do_button(ctx, value("Toggle!"), toggle(state));
 }
